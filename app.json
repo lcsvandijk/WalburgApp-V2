@@ -1,16 +1,19 @@
 {
   "expo": {
-    "name": "WalburgApp-V2",
-    "slug": "WalburgApp-V2",
+    "name": "Walburg College",
+    "slug": "walburg-college-zwijndrecht",
+    "scheme": [
+      "walburgcollege",
+      "m6loapp"
+    ],
     "version": "1.0.0",
-    "orientation": "portrait",
+    "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "scheme": "walburgapp",
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
+      "backgroundColor": "#0D8E68"
     },
     "ios": {
       "supportsTablet": true
@@ -26,6 +29,11 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-web-browser",
+      "expo-font"
+    ]
   }
 }
