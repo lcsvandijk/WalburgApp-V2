@@ -1,11 +1,12 @@
 import { useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -17,8 +18,9 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { appConfig } from '../constants/appConfig';
 import { theme } from '../constants/theme';
 import { useWalburgApp } from '../context/WalburgAppContext';
-import { formatDayLabel, formatTime, getGreeting, isToday, isUpcomingAppointment } from '../lib/date';
+import { formatDayLabel, formatTime, getDefaultSchoolDate, getGreeting, isToday, isUpcomingAppointment } from '../lib/date';
 import { combineAppointmentsForDisplay, formatLessonHoursLabel } from '../lib/schedule';
+import { loadDemoSchoolAgenda } from '../services/demoContent';
 import { loadSchoolAgenda, loadSchoolNews } from '../services/walburgContent';
 import { SchoolAgendaItem, SchoolNewsItem } from '../types/content';
 import { HomeStackParamList } from '../types/navigation';
@@ -54,38 +56,38 @@ export function HomeScreen() {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const navigation = useNavigation<NativeStackNavigationProp<HomeStackParamList>>();
-  const { appointments, session } = useWalburgApp();
+  const { appointments, isDemoMode, refreshAppData, session } = useWalburgApp();
   const [agendaItems, setAgendaItems] = useState<SchoolAgendaItem[]>([]);
   const [newsItems, setNewsItems] = useState<SchoolNewsItem[]>([]);
   const [isContentLoading, setIsContentLoading] = useState(true);
   const [contentError, setContentError] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   const isWideLayout = width >= appConfig.layout.landscapeWidth;
 
+  const loadContent = useCallback(async () => {
+    setIsContentLoading(true);
+    setContentError(null);
+
+    const [agendaResult, newsResult] = await Promise.allSettled([
+      isDemoMode ? loadDemoSchoolAgenda() : loadSchoolAgenda(),
+      loadSchoolNews(),
+    ]);
+
+    setAgendaItems(agendaResult.status === 'fulfilled' ? agendaResult.value : []);
+    setNewsItems(newsResult.status === 'fulfilled' ? newsResult.value : []);
+
+    const errors = [
+      agendaResult.status === 'rejected' ? 'schoolagenda' : null,
+      newsResult.status === 'rejected' ? 'nieuws' : null,
+    ].filter(Boolean);
+
+    setContentError(errors.length > 0 ? `Laden van ${errors.join(' en ')} mislukte.` : null);
+    setIsContentLoading(false);
+  }, [isDemoMode]);
+
   useEffect(() => {
     let active = true;
-
-    async function loadContent() {
-      setIsContentLoading(true);
-      setContentError(null);
-
-      const [agendaResult, newsResult] = await Promise.allSettled([loadSchoolAgenda(), loadSchoolNews()]);
-
-      if (!active) {
-        return;
-      }
-
-      setAgendaItems(agendaResult.status === 'fulfilled' ? agendaResult.value : []);
-      setNewsItems(newsResult.status === 'fulfilled' ? newsResult.value : []);
-
-      const errors = [
-        agendaResult.status === 'rejected' ? 'schoolagenda' : null,
-        newsResult.status === 'rejected' ? 'nieuws' : null,
-      ].filter(Boolean);
-
-      setContentError(errors.length > 0 ? `Laden van ${errors.join(' en ')} mislukte.` : null);
-      setIsContentLoading(false);
-    }
 
     loadContent().catch((error) => {
       if (!active) {
@@ -101,37 +103,98 @@ export function HomeScreen() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [loadContent]);
+
+  const handleRefresh = useCallback(async () => {
+    setIsRefreshing(true);
+
+    try {
+      await Promise.all([
+        session
+          ? refreshAppData().catch(() => {
+              return;
+            })
+          : Promise.resolve(),
+        loadContent().catch(() => {
+          return;
+        }),
+      ]);
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [loadContent, refreshAppData, session]);
 
   const now = new Date();
+  const contentReferenceDate = isDemoMode ? getDefaultSchoolDate(now) : now;
   const greeting = session?.firstName ? `${getGreeting()}, ${session.firstName}` : getGreeting();
 
   const todayAgenda = useMemo(
     () =>
       agendaItems
-        .filter((item) => isToday(item.start, now))
+        .filter((item) => isToday(item.start, contentReferenceDate))
         .sort((left, right) => new Date(left.start).getTime() - new Date(right.start).getTime()),
-    [agendaItems],
+    [agendaItems, contentReferenceDate],
   );
 
   const todayLessons = useMemo(
-    () => combineAppointmentsForDisplay(appointments.filter((appointment) => isToday(appointment.start, now))),
-    [appointments],
+    () => combineAppointmentsForDisplay(appointments.filter((appointment) => isToday(appointment.start, contentReferenceDate))),
+    [appointments, contentReferenceDate],
   );
 
   const nextLesson = useMemo(
-    () =>
-      todayLessons
+    () => {
+      if (isDemoMode) {
+        return todayLessons[0];
+      }
+
+      return todayLessons
         .filter((appointment) => isUpcomingAppointment(appointment, now))
-        .sort((left, right) => new Date(left.start).getTime() - new Date(right.start).getTime())[0],
-    [todayLessons],
+        .sort((left, right) => new Date(left.start).getTime() - new Date(right.start).getTime())[0];
+    },
+    [isDemoMode, now, todayLessons],
   );
+
+  const schoolCards = [
+    {
+      key: 'about',
+      title: 'Over onze school',
+      description: 'Een pagina in Walburg-stijl met het verhaal van de school.',
+      onPress: () => navigation.navigate('SchoolPage', { pageId: 'about' }),
+    },
+    {
+      key: 'staff',
+      title: 'Personeel',
+      description: 'Zoek medewerkers en open per persoon een eigen profielpagina.',
+      onPress: () => navigation.navigate('SchoolStaffDirectory'),
+    },
+    {
+      key: 'dmr',
+      title: 'DMR',
+      description: 'Vergaderdata, samenstelling en medezeggenschap op school.',
+      onPress: () => navigation.navigate('SchoolPage', { pageId: 'dmr' }),
+    },
+    {
+      key: 'student-council',
+      title: 'Leerlingenraad',
+      description: 'Info over de leerlingenraad en een link naar hun eigen site.',
+      onPress: () => navigation.navigate('SchoolPage', { pageId: 'studentCouncil' }),
+    },
+    {
+      key: 'floor-plan',
+      title: 'Plattegrond',
+      description: 'Open de algemene plattegrond als aparte subpagina en blader per verdieping door het gebouw.',
+      onPress: () => navigation.navigate('FloorPlan'),
+    },
+  ];
 
   return (
     <View style={styles.screen}>
       <ScrollView
         bounces={false}
         contentContainerStyle={{ paddingBottom: 112 + insets.bottom }}
+        refreshControl={
+          <RefreshControl onRefresh={handleRefresh} refreshing={isRefreshing} tintColor={theme.colors.brandBlue} />
+        }
         showsVerticalScrollIndicator={false}
       >
         <LinearGradient
@@ -142,7 +205,7 @@ export function HomeScreen() {
         >
           <View style={styles.heroInner}>
             <Text style={styles.heroTitle}>{greeting}</Text>
-            {session ? <Text style={styles.heroMeta}>Laatste sync | {formatSyncLabel(session.lastSyncedAt)}</Text> : null}
+            {session ? <Text style={styles.heroMeta}>Laatst bijgewerkt | {formatSyncLabel(session.lastSyncedAt)}</Text> : null}
           </View>
         </LinearGradient>
 
@@ -265,6 +328,20 @@ export function HomeScreen() {
                 ))}
               </ScrollView>
             )}
+          </View>
+        </View>
+
+        <View style={styles.section}>
+          <View style={styles.sectionInner}>
+            <Text style={styles.sectionTitle}>Onze school</Text>
+            <View style={[styles.schoolCardGrid, isWideLayout ? styles.schoolCardGridWide : null]}>
+              {schoolCards.map((card) => (
+                <Pressable key={card.key} onPress={card.onPress} style={[styles.schoolCard, isWideLayout ? styles.schoolCardWide : null]}>
+                  <Text style={styles.schoolCardTitle}>{card.title}</Text>
+                  <Text style={styles.schoolCardText}>{card.description}</Text>
+                </Pressable>
+              ))}
+            </View>
           </View>
         </View>
       </ScrollView>
@@ -411,6 +488,37 @@ const styles = StyleSheet.create({
     fontFamily: theme.fonts.medium,
     fontSize: 14,
     lineHeight: 20,
+    marginTop: 8,
+  },
+  schoolCardGrid: {
+    gap: 14,
+  },
+  schoolCardGridWide: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+  },
+  schoolCard: {
+    backgroundColor: theme.colors.paper,
+    borderColor: theme.colors.divider,
+    borderRadius: theme.radius.md,
+    borderWidth: 1,
+    paddingHorizontal: 18,
+    paddingVertical: 18,
+  },
+  schoolCardWide: {
+    width: '48.8%',
+  },
+  schoolCardTitle: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.heavy,
+    fontSize: 20,
+    lineHeight: 26,
+  },
+  schoolCardText: {
+    color: theme.colors.textSoft,
+    fontFamily: theme.fonts.medium,
+    fontSize: 14,
+    lineHeight: 21,
     marginTop: 8,
   },
   newsSection: {

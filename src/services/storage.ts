@@ -9,10 +9,15 @@ const PREFERENCES_KEY = 'walburg.preferences';
 const MAGISTER_CACHE_KEY = 'walburg.magister.cache';
 
 const DEFAULT_PREFERENCES: AppPreferences = {
+  mailNotificationsEnabled: true,
+  priorityMailOnlyNotifications: false,
   gradeNotifications: true,
   scheduleChangeNotifications: true,
   agendaReminders: false,
   agendaAutoAddEnabled: false,
+  demoModeEnabled: false,
+  lessonRemindersEnabled: false,
+  onboardingCompleted: false,
   roundAveragesToWholeNumbers: false,
   savedReminderEventIds: [],
 };

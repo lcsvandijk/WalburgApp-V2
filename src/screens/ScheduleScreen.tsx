@@ -1,10 +1,12 @@
 import { useFocusEffect } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
+import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Modal,
+  PanResponder,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -16,12 +18,14 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { FloorPlanViewer } from '../components/FloorPlanViewer';
 import { appConfig } from '../constants/appConfig';
 import { theme } from '../constants/theme';
 import { useWalburgApp } from '../context/WalburgAppContext';
 import {
   addDays,
   formatApiDate,
+  formatDayLabel,
   formatShortDate,
   formatShortWeekday,
   formatTime,
@@ -31,18 +35,47 @@ import {
   getWeekStart,
   isSameDay,
 } from '../lib/date';
+import { findFloorPlanMatch } from '../lib/floorPlan';
+import { formatDisplayLocation } from '../lib/location';
 import { combineAppointmentsForDisplay, formatLessonHoursLabel } from '../lib/schedule';
+import { loadDemoActivities, loadDemoSchoolAgenda } from '../services/demoContent';
+import { fetchActivitiesFromTokens } from '../services/magister';
 import { loadSchoolAgenda } from '../services/walburgContent';
 import { SchoolAgendaItem } from '../types/content';
-import { MagisterAppointment } from '../types/magister';
+import { MagisterActivity, MagisterAppointment } from '../types/magister';
+import { ScheduleStackParamList } from '../types/navigation';
 
-type ScheduleMode = 'schedule' | 'calendar';
+type ScheduleMode = 'schedule' | 'calendar' | 'schoolwork' | 'activities';
 type CalendarRangePreset = 'thisWeek' | 'nextWeek';
 type ScheduleTimelineItem =
   | { type: 'pause'; id: string; minutes: number }
   | { type: 'appointment'; appointment: MagisterAppointment };
+type StudyWeekGroup = {
+  date: Date;
+  items: MagisterAppointment[];
+};
 
-function formatLessonHours(value?: string | null, start?: string, end?: string) {
+type Props = NativeStackScreenProps<ScheduleStackParamList, 'ScheduleIndex'>;
+
+function isFlexAppointment(appointment: MagisterAppointment) {
+  return appointment.type === 7;
+}
+
+function isActivityAppointment(appointment: MagisterAppointment) {
+  return appointment.type === 2;
+}
+
+function isFreeDayAppointment(appointment: MagisterAppointment) {
+  return appointment.type === 6;
+}
+
+function formatLessonHours(appointment: MagisterAppointment) {
+  if (appointment.isAllDay) {
+    return 'Hele dag';
+  }
+
+  const { lessonHours: value, start, end } = appointment;
+
   if (value) {
     return formatLessonHoursLabel(value);
   }
@@ -60,6 +93,22 @@ function formatAgendaMoment(item: SchoolAgendaItem) {
   }
 
   return `${formatTime(item.start)} - ${formatTime(item.end)}`;
+}
+
+function formatActivityWindow(start?: string | null, end?: string | null) {
+  if (start && end) {
+    return `${formatDayLabel(start)} | ${formatTime(start)} - ${formatTime(end)}`;
+  }
+
+  if (start) {
+    return `Vanaf ${formatDayLabel(start)} | ${formatTime(start)}`;
+  }
+
+  if (end) {
+    return `Tot ${formatDayLabel(end)} | ${formatTime(end)}`;
+  }
+
+  return null;
 }
 
 function getInfoLabel(appointment: MagisterAppointment) {
@@ -86,10 +135,28 @@ function getInfoLabel(appointment: MagisterAppointment) {
 }
 
 function isLessonAppointment(appointment: MagisterAppointment) {
-  return appointment.subject !== 'Schoolafspraak';
+  return (
+    !isActivityAppointment(appointment) &&
+    !isFreeDayAppointment(appointment) &&
+    (appointment.subject !== 'Schoolafspraak' || appointment.title !== 'Schoolafspraak')
+  );
 }
 
 function getLessonHeading(appointment: MagisterAppointment) {
+  if (isFreeDayAppointment(appointment)) {
+    return {
+      title: 'Lesvrije dag',
+      subtitle: appointment.title,
+    };
+  }
+
+  if (isActivityAppointment(appointment)) {
+    return {
+      title: appointment.title,
+      subtitle: appointment.subject !== 'Schoolafspraak' && appointment.subject !== appointment.title ? appointment.subject : null,
+    };
+  }
+
   if (!isLessonAppointment(appointment)) {
     return {
       title: appointment.title,
@@ -104,28 +171,110 @@ function getLessonHeading(appointment: MagisterAppointment) {
 }
 
 function isVisibleInLessonList(appointment: MagisterAppointment) {
-  return isLessonAppointment(appointment);
+  return (
+    isLessonAppointment(appointment) ||
+    isFlexAppointment(appointment) ||
+    isActivityAppointment(appointment) ||
+    isFreeDayAppointment(appointment) ||
+    appointment.status === 2
+  );
+}
+
+function getSecondaryMetaLine(appointment: MagisterAppointment) {
+  if (appointment.isCancelled) {
+    return 'Uitgevallen';
+  }
+
+  if (isFreeDayAppointment(appointment)) {
+    return null;
+  }
+
+  const metaParts = [appointment.location, appointment.teachers].filter(
+    (value) => Boolean(value) && value !== 'Locatie volgt' && value !== 'Docent onbekend',
+  );
+
+  if (metaParts.length > 0) {
+    return metaParts.join(' | ');
+  }
+
+  if (isActivityAppointment(appointment)) {
+    return 'Activiteit';
+  }
+
+  return appointment.subject;
+}
+
+function canToggleLessonCompletion(appointment: MagisterAppointment) {
+  return (
+    !appointment.isCancelled &&
+    !isActivityAppointment(appointment) &&
+    !isFreeDayAppointment(appointment) &&
+    Boolean(appointment.description?.trim())
+  );
+}
+
+function formatStudyItemCount(count: number) {
+  if (count === 0) {
+    return 'Rustig';
+  }
+
+  if (count === 1) {
+    return '1 item';
+  }
+
+  return `${count} items`;
 }
 
 function buildScheduleTimeline(appointments: MagisterAppointment[]): ScheduleTimelineItem[] {
   const visibleAppointments = appointments.filter(isVisibleInLessonList);
   const timeline: ScheduleTimelineItem[] = [];
+  let cancelledBlockStart: string | null = null;
 
   visibleAppointments.forEach((appointment, index) => {
     const previous = visibleAppointments[index - 1];
 
     if (previous) {
-      const pauseMinutes = Math.round(
-        (new Date(appointment.start).getTime() - new Date(previous.end).getTime()) / 60_000,
-      );
-
-      if (pauseMinutes > 0) {
+      if (previous.isAllDay || appointment.isAllDay) {
         timeline.push({
-          type: 'pause',
-          id: `${previous.id}__pause__${appointment.id}`,
-          minutes: pauseMinutes,
+          type: 'appointment',
+          appointment,
         });
+        return;
       }
+
+      if (previous.isCancelled) {
+        if (!appointment.isCancelled && cancelledBlockStart) {
+          const pauseMinutes = Math.round(
+            (new Date(appointment.start).getTime() - new Date(cancelledBlockStart).getTime()) / 60_000,
+          );
+
+          if (pauseMinutes > 0) {
+            timeline.push({
+              type: 'pause',
+              id: `${previous.id}__pause__${appointment.id}`,
+              minutes: pauseMinutes,
+            });
+          }
+
+          cancelledBlockStart = null;
+        }
+      } else {
+        const pauseMinutes = Math.round(
+          (new Date(appointment.start).getTime() - new Date(previous.end).getTime()) / 60_000,
+        );
+
+        if (pauseMinutes > 0) {
+          timeline.push({
+            type: 'pause',
+            id: `${previous.id}__pause__${appointment.id}`,
+            minutes: pauseMinutes,
+          });
+        }
+      }
+    }
+
+    if (appointment.isCancelled && !cancelledBlockStart) {
+      cancelledBlockStart = appointment.start;
     }
 
     timeline.push({
@@ -137,14 +286,26 @@ function buildScheduleTimeline(appointments: MagisterAppointment[]): ScheduleTim
   return timeline;
 }
 
-export function ScheduleScreen() {
+function getAdjacentSchoolDay(date: Date, direction: -1 | 1) {
+  let nextDate = addDays(date, direction);
+
+  while (nextDate.getDay() === 0 || nextDate.getDay() === 6) {
+    nextDate = addDays(nextDate, direction);
+  }
+
+  return nextDate;
+}
+
+export function ScheduleScreen({ navigation, route }: Props) {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const {
     appointments,
     ensureScheduleRangeLoaded,
     errorMessage,
+    isDemoMode,
     preferences,
+    setAppointmentCompletion,
     session,
     toggleAgendaReminder,
   } = useWalburgApp();
@@ -153,8 +314,11 @@ export function ScheduleScreen() {
   const [selectedWeekStart, setSelectedWeekStart] = useState(getWeekStart(defaultSchoolDate));
   const [selectedDate, setSelectedDate] = useState(defaultSchoolDate);
   const [selectedLesson, setSelectedLesson] = useState<MagisterAppointment | null>(null);
+  const [selectedLocationLesson, setSelectedLocationLesson] = useState<MagisterAppointment | null>(null);
   const [selectedAgendaItem, setSelectedAgendaItem] = useState<SchoolAgendaItem | null>(null);
   const [isScheduleLoading, setIsScheduleLoading] = useState(false);
+  const [activities, setActivities] = useState<MagisterActivity[]>([]);
+  const [isActivitiesLoading, setIsActivitiesLoading] = useState(false);
   const [agendaItems, setAgendaItems] = useState<SchoolAgendaItem[]>([]);
   const [isAgendaLoading, setIsAgendaLoading] = useState(true);
   const [rangePreset, setRangePreset] = useState<CalendarRangePreset>('thisWeek');
@@ -162,24 +326,41 @@ export function ScheduleScreen() {
   const [isRangePickerVisible, setIsRangePickerVisible] = useState(false);
   const [isSearchVisible, setIsSearchVisible] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isUpdatingLessonCompletion, setIsUpdatingLessonCompletion] = useState(false);
+  const focusAppointmentId = route.params?.focusAppointmentId;
+  const focusDateParam = route.params?.focusDate;
+  const focusNonce = route.params?.focusNonce;
 
   const isWideLayout = width >= appConfig.layout.landscapeWidth;
   const weekDays = useMemo(() => getSchoolWeekDates(selectedWeekStart), [selectedWeekStart]);
 
   useFocusEffect(
     useCallback(() => {
-      const focusDate = getDefaultSchoolDate();
+      const focusDate = focusDateParam ? new Date(focusDateParam) : getDefaultSchoolDate();
 
-      setMode('schedule');
+      if (focusAppointmentId || focusDateParam) {
+        setMode('schedule');
+        setSelectedWeekStart(getWeekStart(focusDate));
+        setSelectedDate(focusDate);
+        setSelectedLesson(null);
+        setSelectedLocationLesson(null);
+        setSelectedAgendaItem(null);
+        setIsRangePickerVisible(false);
+        setIsSearchVisible(false);
+
+        return undefined;
+      }
+
       setSelectedWeekStart(getWeekStart(focusDate));
       setSelectedDate(focusDate);
       setSelectedLesson(null);
+      setSelectedLocationLesson(null);
       setSelectedAgendaItem(null);
       setIsRangePickerVisible(false);
       setIsSearchVisible(false);
 
       return undefined;
-    }, []),
+    }, [focusAppointmentId, focusDateParam]),
   );
 
   useEffect(() => {
@@ -219,7 +400,7 @@ export function ScheduleScreen() {
       setIsAgendaLoading(true);
 
       try {
-        const nextAgenda = await loadSchoolAgenda();
+        const nextAgenda = await (isDemoMode ? loadDemoSchoolAgenda() : loadSchoolAgenda());
 
         if (active) {
           setAgendaItems(nextAgenda);
@@ -241,12 +422,52 @@ export function ScheduleScreen() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [isDemoMode]);
+
+  const refreshActivities = useCallback(async () => {
+    if (isDemoMode) {
+      setIsActivitiesLoading(true);
+
+      try {
+        const nextActivities = await loadDemoActivities();
+        setActivities(nextActivities);
+      } finally {
+        setIsActivitiesLoading(false);
+      }
+
+      return;
+    }
+
+    if (!session?.accessToken) {
+      setActivities([]);
+      return;
+    }
+
+    setIsActivitiesLoading(true);
+
+    try {
+      const personId = session.personId ?? session.id;
+      const nextActivities = await fetchActivitiesFromTokens(session, personId);
+      setActivities(nextActivities);
+    } finally {
+      setIsActivitiesLoading(false);
+    }
+  }, [isDemoMode, session]);
+
+  useFocusEffect(
+    useCallback(() => {
+      refreshActivities().catch(() => {
+        setActivities([]);
+      });
+
+      return undefined;
+    }, [refreshActivities]),
+  );
 
   const refreshAgenda = useCallback(async () => {
-    const nextAgenda = await loadSchoolAgenda();
+    const nextAgenda = await (isDemoMode ? loadDemoSchoolAgenda() : loadSchoolAgenda());
     setAgendaItems(nextAgenda);
-  }, []);
+  }, [isDemoMode]);
 
   const handleRefresh = useCallback(async () => {
     setIsRefreshing(true);
@@ -262,11 +483,32 @@ export function ScheduleScreen() {
         refreshAgenda().catch(() => {
           return;
         }),
+        refreshActivities().catch(() => {
+          return;
+        }),
       ]);
     } finally {
       setIsRefreshing(false);
     }
-  }, [ensureScheduleRangeLoaded, refreshAgenda, selectedWeekStart, session]);
+  }, [ensureScheduleRangeLoaded, refreshActivities, refreshAgenda, selectedWeekStart, session]);
+
+  const handleLessonCompletionToggle = useCallback(async () => {
+    if (!selectedLesson || !canToggleLessonCompletion(selectedLesson) || isUpdatingLessonCompletion) {
+      return;
+    }
+
+    setIsUpdatingLessonCompletion(true);
+
+    try {
+      const updatedLesson = await setAppointmentCompletion(selectedLesson.id, !selectedLesson.completed);
+
+      if (updatedLesson) {
+        setSelectedLesson(updatedLesson);
+      }
+    } finally {
+      setIsUpdatingLessonCompletion(false);
+    }
+  }, [isUpdatingLessonCompletion, selectedLesson, setAppointmentCompletion]);
 
   const combinedDayAppointments = useMemo(
     () =>
@@ -282,12 +524,51 @@ export function ScheduleScreen() {
     () => buildScheduleTimeline(combinedDayAppointments),
     [combinedDayAppointments],
   );
+  const studyWeekGroups = useMemo<StudyWeekGroup[]>(
+    () =>
+      weekDays.map((day) => ({
+        date: day,
+        items: combineAppointmentsForDisplay(
+          appointments
+            .filter((appointment) => isSameDay(appointment.start, day))
+            .filter(
+              (appointment) =>
+                Boolean(appointment.description?.trim()) &&
+                !appointment.isCancelled &&
+                !isActivityAppointment(appointment) &&
+                !isFreeDayAppointment(appointment),
+            )
+            .sort((left, right) => new Date(left.start).getTime() - new Date(right.start).getTime()),
+        ),
+      })),
+    [appointments, weekDays],
+  );
+  const hasStudyWeekEntries = useMemo(
+    () => studyWeekGroups.some((group) => group.items.length > 0),
+    [studyWeekGroups],
+  );
+  const totalStudyItems = useMemo(
+    () => studyWeekGroups.reduce((total, group) => total + group.items.length, 0),
+    [studyWeekGroups],
+  );
+  const completedStudyItems = useMemo(
+    () =>
+      studyWeekGroups.reduce(
+        (total, group) => total + group.items.filter((item) => item.completed).length,
+        0,
+      ),
+    [studyWeekGroups],
+  );
 
   const agendaRangeStart = useMemo(() => {
     const currentWeekStart = getWeekStart(defaultSchoolDate);
     return rangePreset === 'nextWeek' ? addDays(currentWeekStart, 7) : currentWeekStart;
   }, [defaultSchoolDate, rangePreset]);
   const agendaRangeEnd = addDays(agendaRangeStart, 6);
+  const selectedLocationFloorPlanMatch = useMemo(
+    () => findFloorPlanMatch(selectedLocationLesson?.location),
+    [selectedLocationLesson],
+  );
 
   const filteredAgendaDays = useMemo(() => {
     const normalizedQuery = searchQuery.trim().toLowerCase();
@@ -325,6 +606,66 @@ export function ScheduleScreen() {
       };
     });
   }, [agendaItems, agendaRangeStart, searchQuery]);
+  const hasActivities = activities.length > 0;
+
+  useEffect(() => {
+    if (!hasActivities && mode === 'activities') {
+      setMode('schedule');
+    }
+  }, [hasActivities, mode]);
+
+  useEffect(() => {
+    if (!focusAppointmentId) {
+      return;
+    }
+
+    const nextLesson =
+      appointments.find((appointment) => appointment.id === focusAppointmentId) ?? null;
+
+    if (!nextLesson) {
+      return;
+    }
+
+    const nextDate = new Date(nextLesson.start);
+    setMode('schedule');
+    setSelectedWeekStart(getWeekStart(nextDate));
+    setSelectedDate(nextDate);
+    setSelectedLesson(nextLesson);
+    setSelectedLocationLesson(null);
+    setSelectedAgendaItem(null);
+
+    navigation.setParams({
+      focusAppointmentId: undefined,
+      focusDate: undefined,
+      focusNonce: undefined,
+    });
+  }, [appointments, focusAppointmentId, focusNonce, navigation]);
+
+  const shiftSelectedDay = useCallback((direction: -1 | 1) => {
+    const nextDate = getAdjacentSchoolDay(selectedDate, direction);
+
+    setSelectedDate(nextDate);
+    setSelectedWeekStart(getWeekStart(nextDate));
+  }, [selectedDate]);
+
+  const scheduleSwipeResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onMoveShouldSetPanResponder: (_, gestureState) => {
+          return Math.abs(gestureState.dx) > 18 && Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 1.25;
+        },
+        onPanResponderRelease: (_, gestureState) => {
+          if (gestureState.dx <= -56) {
+            shiftSelectedDay(1);
+          }
+
+          if (gestureState.dx >= 56) {
+            shiftSelectedDay(-1);
+          }
+        },
+      }),
+    [shiftSelectedDay],
+  );
 
   function shiftWeek(direction: -1 | 1) {
     const currentIndex = Math.max(
@@ -361,16 +702,54 @@ export function ScheduleScreen() {
                   onPress={() => setMode('schedule')}
                   style={[styles.modeButton, mode === 'schedule' ? styles.modeButtonActive : null]}
                 >
-                  <Ionicons color={theme.colors.brandBlueDeep} name="create-outline" size={18} />
+                  <Ionicons
+                    color={mode === 'schedule' ? theme.colors.brandBlueDeep : theme.colors.textMuted}
+                    name="create-outline"
+                    size={18}
+                  />
+                </Pressable>
+                <Pressable
+                  onPress={() => setMode('schoolwork')}
+                  style={[styles.modeButton, mode === 'schoolwork' ? styles.modeButtonActive : null]}
+                >
+                  <Ionicons
+                    color={mode === 'schoolwork' ? theme.colors.brandBlueDeep : theme.colors.textMuted}
+                    name="reader-outline"
+                    size={18}
+                  />
                 </Pressable>
                 <Pressable
                   onPress={() => setMode('calendar')}
                   style={[styles.modeButton, mode === 'calendar' ? styles.modeButtonActive : null]}
                 >
-                  <Ionicons color={theme.colors.brandBlueDeep} name="calendar-clear-outline" size={18} />
+                  <Ionicons
+                    color={mode === 'calendar' ? theme.colors.brandBlueDeep : theme.colors.textMuted}
+                    name="calendar-clear-outline"
+                    size={18}
+                  />
                 </Pressable>
+                {hasActivities ? (
+                  <Pressable
+                    onPress={() => setMode('activities')}
+                    style={[styles.modeButton, mode === 'activities' ? styles.modeButtonActive : null]}
+                  >
+                    <Ionicons
+                      color={mode === 'activities' ? theme.colors.brandBlueDeep : theme.colors.textMuted}
+                      name="pencil-outline"
+                      size={18}
+                    />
+                  </Pressable>
+                ) : null}
               </View>
-              <Text style={styles.heroLabel}>{mode === 'schedule' ? 'Lesrooster' : 'Schoolagenda'}</Text>
+              <Text style={styles.heroLabel}>
+                {mode === 'schedule'
+                  ? 'Lesrooster'
+                  : mode === 'calendar'
+                    ? 'Schoolagenda'
+                    : mode === 'schoolwork'
+                      ? 'Huiswerk'
+                      : 'Activiteiten'}
+              </Text>
             </View>
           </View>
         </View>
@@ -384,7 +763,7 @@ export function ScheduleScreen() {
           ) : null}
 
           {mode === 'schedule' ? (
-            <>
+            <View {...scheduleSwipeResponder.panHandlers}>
               <View style={styles.weekCard}>
                 <View style={styles.weekHeader}>
                   <Pressable onPress={() => shiftWeek(-1)} style={styles.arrowButton}>
@@ -452,14 +831,50 @@ export function ScheduleScreen() {
 
                     const appointment = item.appointment;
                     const heading = getLessonHeading(appointment);
-                    const hasInfo = Boolean(appointment.description) && !appointment.isCancelled;
+                    const hasInfo = Boolean(appointment.description?.trim()) && !appointment.isCancelled;
                     const infoLabel = !appointment.isCancelled && hasInfo ? getInfoLabel(appointment) : null;
                     const isTestBadge = infoLabel === 'Toets';
                     const isCancelled = appointment.isCancelled;
+                    const isFlex = isFlexAppointment(appointment);
+                    const locationMatch = !isCancelled ? findFloorPlanMatch(appointment.location) : null;
+                    const secondaryMeta = getSecondaryMetaLine(appointment);
+                    const statusChips = [
+                      isCancelled ? (
+                        <View key="cancelled" style={styles.lessonCancelledBadge}>
+                          <Text style={styles.lessonCancelledBadgeText}>Uitgevallen</Text>
+                        </View>
+                      ) : null,
+                      isFlex ? (
+                        <View key="flex" style={styles.lessonTypeBadge}>
+                          <Text style={styles.lessonTypeBadgeText}>Flexuur</Text>
+                        </View>
+                      ) : null,
+                      infoLabel ? (
+                        <View
+                          key="info"
+                          style={[
+                            styles.lessonInfoBadge,
+                            isTestBadge ? styles.lessonInfoBadgeDark : null,
+                            isCancelled ? styles.lessonInfoBadgeCancelled : null,
+                          ]}
+                        >
+                          <Text
+                            style={[
+                              styles.lessonInfoBadgeText,
+                              isTestBadge ? styles.lessonInfoBadgeTextDark : null,
+                              isCancelled ? styles.lessonInfoBadgeTextCancelled : null,
+                            ]}
+                          >
+                            {infoLabel}
+                          </Text>
+                        </View>
+                      ) : null,
+                    ].filter(Boolean);
 
                     return (
                       <Pressable
                         key={appointment.id}
+                        disabled={Boolean(isCancelled)}
                         onPress={() => setSelectedLesson(appointment)}
                         style={[
                           styles.lessonCard,
@@ -470,61 +885,57 @@ export function ScheduleScreen() {
                         <View style={styles.lessonTopRow}>
                           <View style={styles.lessonCopy}>
                             <Text
-                              numberOfLines={appConfig.ui.previewLines}
+                              numberOfLines={2}
                               style={[styles.lessonTitle, isCancelled ? styles.lessonTitleCancelled : null]}
                             >
                               {heading.title}
                             </Text>
                             {heading.subtitle ? (
                               <Text
-                                numberOfLines={1}
+                                numberOfLines={2}
                                 style={[styles.lessonSubtitle, isCancelled ? styles.lessonSubtitleCancelled : null]}
                               >
                                 {heading.subtitle}
                               </Text>
                             ) : null}
                           </View>
-                          <View style={styles.lessonBadgeColumn}>
+                          <View style={styles.lessonSidebar}>
                             <View style={[styles.lessonBadge, isCancelled ? styles.lessonBadgeCancelled : null]}>
-                              <Text style={[styles.lessonBadgeText, isCancelled ? styles.lessonBadgeTextCancelled : null]}>
-                                {formatLessonHours(appointment.lessonHours, appointment.start, appointment.end)}
+                              <Text
+                                adjustsFontSizeToFit
+                                minimumFontScale={0.82}
+                                numberOfLines={1}
+                                style={[styles.lessonBadgeText, isCancelled ? styles.lessonBadgeTextCancelled : null]}
+                              >
+                                {formatLessonHours(appointment)}
                               </Text>
                             </View>
-                            {isCancelled ? (
-                              <View style={styles.lessonCancelledBadge}>
-                                <Text style={styles.lessonCancelledBadgeText}>Uitgevallen</Text>
-                              </View>
-                            ) : null}
-                            {infoLabel ? (
-                              <View
-                                style={[
-                                  styles.lessonInfoBadge,
-                                  isTestBadge ? styles.lessonInfoBadgeDark : null,
-                                  isCancelled ? styles.lessonInfoBadgeCancelled : null,
-                                ]}
+                            {statusChips.length > 0 ? <View style={styles.lessonSidebarBadges}>{statusChips}</View> : null}
+                            {locationMatch ? (
+                              <Pressable
+                                hitSlop={8}
+                                onPress={(event) => {
+                                  event.stopPropagation();
+                                  setSelectedLocationLesson(appointment);
+                                }}
+                                style={styles.lessonWalkButton}
                               >
-                                <Text
-                                  style={[
-                                    styles.lessonInfoBadgeText,
-                                    isTestBadge ? styles.lessonInfoBadgeTextDark : null,
-                                    isCancelled ? styles.lessonInfoBadgeTextCancelled : null,
-                                  ]}
-                                >
-                                  {infoLabel}
-                                </Text>
-                              </View>
+                                <Ionicons color={theme.colors.brandBlue} name="walk-outline" size={20} />
+                              </Pressable>
                             ) : null}
                           </View>
                         </View>
                         <Text numberOfLines={1} style={[styles.lessonMeta, isCancelled ? styles.lessonMetaCancelled : null]}>
                           {formatTime(appointment.start)} - {formatTime(appointment.end)}
                         </Text>
-                        <Text
-                          numberOfLines={appConfig.ui.previewLines}
-                          style={[styles.lessonMeta, isCancelled ? styles.lessonMetaCancelled : null]}
-                        >
-                          {isCancelled ? 'Uitgevallen' : `${appointment.location} | ${appointment.teachers}`}
-                        </Text>
+                        {secondaryMeta ? (
+                          <Text
+                            numberOfLines={3}
+                            style={[styles.lessonMeta, isCancelled ? styles.lessonMetaCancelled : null]}
+                          >
+                            {secondaryMeta}
+                          </Text>
+                        ) : null}
                         {isCancelled ? (
                           <Text
                             numberOfLines={appConfig.ui.previewLines}
@@ -549,8 +960,8 @@ export function ScheduleScreen() {
                   })}
                 </View>
               )}
-            </>
-          ) : (
+            </View>
+          ) : mode === 'calendar' ? (
             <>
               <View style={styles.filterCard}>
                 <Pressable onPress={() => setIsRangePickerVisible(true)} style={styles.filterButton}>
@@ -608,6 +1019,210 @@ export function ScheduleScreen() {
                 </View>
               )}
             </>
+          ) : mode === 'schoolwork' ? (
+            <>
+              <View style={styles.weekCard}>
+                <View style={styles.weekHeader}>
+                  <Pressable onPress={() => shiftWeek(-1)} style={styles.arrowButton}>
+                    <Ionicons color={theme.colors.brandBlueDeep} name="chevron-back" size={20} />
+                  </Pressable>
+                  <View style={styles.weekHeaderCopy}>
+                    <Text style={styles.weekNumber}>Week {getWeekNumber(selectedWeekStart)}</Text>
+                    <Text style={styles.weekRange}>
+                      {formatShortDate(selectedWeekStart)} - {formatShortDate(addDays(selectedWeekStart, 4))}
+                    </Text>
+                  </View>
+                  <Pressable onPress={() => shiftWeek(1)} style={styles.arrowButton}>
+                    <Ionicons color={theme.colors.brandBlueDeep} name="chevron-forward" size={20} />
+                  </Pressable>
+                </View>
+
+                <View style={styles.dayChipRow}>
+                  {studyWeekGroups.map((group) => (
+                    <View key={group.date.toISOString()} style={[styles.dayChip, styles.studyDayChip]}>
+                      <Text style={styles.dayChipLabel}>{formatShortWeekday(group.date)}</Text>
+                      <Text style={styles.studyDayChipMeta}>{formatStudyItemCount(group.items.length)}</Text>
+                    </View>
+                  ))}
+                </View>
+                <View style={styles.studyProgressRow}>
+                  <Text style={styles.studyProgressLabel}>Afgerond</Text>
+                  <Text style={styles.studyProgressValue}>
+                    {completedStudyItems} van {totalStudyItems}
+                  </Text>
+                </View>
+              </View>
+
+              {!session ? (
+                <View style={styles.stateCard}>
+                  <Text style={styles.stateText}>Log in via profiel om je lesstof en toetsen uit Magister te laden.</Text>
+                </View>
+              ) : isScheduleLoading && !hasStudyWeekEntries ? (
+                <View style={styles.stateCard}>
+                  <ActivityIndicator color={theme.colors.brandBlue} />
+                </View>
+              ) : !hasStudyWeekEntries ? (
+                <View style={styles.stateCard}>
+                  <Text style={styles.stateText}>Voor deze week staat er nog geen huiswerk, toets of info klaar.</Text>
+                </View>
+              ) : (
+                <View style={[styles.section, isWideLayout ? styles.sectionWide : null]}>
+                  {studyWeekGroups.map((group) => (
+                    <View
+                      key={group.date.toISOString()}
+                      style={[styles.agendaDayCard, isWideLayout ? styles.agendaDayCardWide : null]}
+                    >
+                      <View style={styles.agendaDayHeader}>
+                        <Text style={styles.agendaDayLabel}>{formatShortWeekday(group.date)}</Text>
+                        <Text style={styles.agendaDayMeta}>{formatShortDate(group.date)}</Text>
+                      </View>
+
+                      {group.items.length === 0 ? (
+                        <Text style={styles.agendaEmpty}>Geen lesstof of toetsen voor deze dag.</Text>
+                      ) : (
+                        group.items.map((item) => {
+                          const infoLabel = getInfoLabel(item);
+                          const isTestBadge = infoLabel === 'Toets';
+                          const secondaryMeta = getSecondaryMetaLine(item);
+
+                          return (
+                            <Pressable
+                              key={item.id}
+                              onPress={() => setSelectedLesson(item)}
+                              style={styles.studyItem}
+                            >
+                              <View style={styles.studyItemHeader}>
+                                <View style={styles.studyItemCopy}>
+                                  <Text numberOfLines={2} style={styles.studyItemTitle}>
+                                    {item.subject}
+                                  </Text>
+                                  {item.title !== item.subject ? (
+                                    <Text numberOfLines={2} style={styles.studyItemSubtitle}>
+                                      {item.title}
+                                    </Text>
+                                  ) : null}
+                                </View>
+                                <View style={styles.studyItemSidebar}>
+                                  <View style={styles.lessonBadge}>
+                                    <Text
+                                      adjustsFontSizeToFit
+                                      minimumFontScale={0.82}
+                                      numberOfLines={1}
+                                      style={styles.lessonBadgeText}
+                                    >
+                                      {formatLessonHours(item)}
+                                    </Text>
+                                  </View>
+                                  <View
+                                    style={[
+                                      styles.studyBadge,
+                                      isTestBadge ? styles.studyBadgeDark : null,
+                                      item.completed ? styles.studyBadgeCompleted : null,
+                                    ]}
+                                  >
+                                    <Text
+                                      style={[
+                                        styles.studyBadgeText,
+                                        isTestBadge ? styles.studyBadgeTextDark : null,
+                                        item.completed ? styles.studyBadgeTextCompleted : null,
+                                      ]}
+                                    >
+                                      {infoLabel}
+                                    </Text>
+                                    {item.completed ? (
+                                      <>
+                                        <View style={styles.studyBadgeDivider} />
+                                        <Text style={styles.studyBadgeFooterText}>Afgerond</Text>
+                                      </>
+                                    ) : null}
+                                  </View>
+                                </View>
+                              </View>
+                              <Text numberOfLines={1} style={styles.agendaMeta}>
+                                {formatTime(item.start)} - {formatTime(item.end)}
+                              </Text>
+                              {secondaryMeta ? (
+                                <Text numberOfLines={1} style={styles.studyItemMeta}>
+                                  {secondaryMeta}
+                                </Text>
+                              ) : null}
+                              <Text numberOfLines={appConfig.ui.previewLines + 1} style={styles.studyItemDescription}>
+                                {item.description}
+                              </Text>
+                            </Pressable>
+                          );
+                        })
+                      )}
+                    </View>
+                  ))}
+                </View>
+              )}
+            </>
+          ) : !session ? (
+            <View style={styles.stateCard}>
+              <Text style={styles.stateText}>Log in via profiel om je activiteiten uit Magister te laden.</Text>
+            </View>
+          ) : isActivitiesLoading ? (
+            <View style={styles.stateCard}>
+              <ActivityIndicator color={theme.colors.brandBlue} />
+            </View>
+          ) : !hasActivities ? (
+            <View style={styles.stateCard}>
+              <Text style={styles.stateText}>Er zijn op dit moment geen activiteiten beschikbaar.</Text>
+            </View>
+          ) : (
+            <View style={styles.section}>
+              {activities.map((activity) => {
+                const registrationWindow = formatActivityWindow(activity.subscriptionStart, activity.subscriptionEnd);
+                const visibilityWindow = formatActivityWindow(activity.visibleFrom, activity.visibleTo);
+
+                return (
+                  <Pressable
+                    key={activity.id}
+                    onPress={() =>
+                      navigation.navigate('ActivityDetails', {
+                        activityId: activity.activityId,
+                        details: activity.details,
+                        selfLink: activity.selfLink,
+                        subscriptionEnd: activity.subscriptionEnd,
+                        subscriptionStart: activity.subscriptionStart,
+                        title: activity.title,
+                        visibleFrom: activity.visibleFrom,
+                        visibleTo: activity.visibleTo,
+                      })
+                    }
+                    style={styles.activityCard}
+                  >
+                    <View style={styles.activityCardHeader}>
+                      <View style={styles.activityIconWrap}>
+                        <Ionicons color={theme.colors.brandBlue} name="pencil-outline" size={20} />
+                      </View>
+                      <View style={styles.activityCopy}>
+                        <Text style={styles.activityTitle}>{activity.title}</Text>
+                        {registrationWindow ? (
+                          <Text style={styles.activityMeta}>Inschrijven | {registrationWindow}</Text>
+                        ) : visibilityWindow ? (
+                          <Text style={styles.activityMeta}>Zichtbaar | {visibilityWindow}</Text>
+                        ) : null}
+                      </View>
+                      <Ionicons color={theme.colors.brandBlue} name="chevron-forward" size={20} />
+                    </View>
+                    {activity.details ? (
+                      <Text numberOfLines={appConfig.ui.previewLines + 1} style={styles.activityDescription}>
+                        {activity.details}
+                      </Text>
+                    ) : null}
+                    <View style={styles.activityFooter}>
+                      <Text style={styles.activityFooterText}>
+                        {activity.subscriptionCount > 0
+                          ? `${activity.subscriptionCount} inschrijving${activity.subscriptionCount === 1 ? '' : 'en'} actief`
+                          : 'Nog geen keuzes gemaakt'}
+                      </Text>
+                    </View>
+                  </Pressable>
+                );
+              })}
+            </View>
           )}
         </View>
       </ScrollView>
@@ -622,31 +1237,110 @@ export function ScheduleScreen() {
       >
         <View style={styles.modalScrim}>
           <View style={styles.modalCard}>
+            <ScrollView showsVerticalScrollIndicator={false}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>{selectedLesson ? getLessonHeading(selectedLesson).title : ''}</Text>
+                <Pressable onPress={() => setSelectedLesson(null)} style={styles.modalClose}>
+                  <Ionicons color={theme.colors.brandBlueDeep} name="close" size={20} />
+                </Pressable>
+              </View>
+              {selectedLesson ? (
+                <>
+                  {getLessonHeading(selectedLesson).subtitle ? (
+                    <Text style={styles.modalMeta}>{getLessonHeading(selectedLesson).subtitle}</Text>
+                  ) : null}
+                  <Text style={styles.modalMeta}>
+                    {formatTime(selectedLesson.start)} - {formatTime(selectedLesson.end)} |{' '}
+                    {formatDisplayLocation(selectedLesson.location) || 'Locatie volgt'}
+                  </Text>
+                  <Text style={styles.modalMeta}>{selectedLesson.teachers}</Text>
+                  {canToggleLessonCompletion(selectedLesson) ? (
+                    <Pressable
+                      disabled={isUpdatingLessonCompletion}
+                      onPress={handleLessonCompletionToggle}
+                      style={[
+                        styles.lessonCompletionButton,
+                        selectedLesson.completed ? styles.lessonCompletionButtonActive : null,
+                        isUpdatingLessonCompletion ? styles.lessonCompletionButtonDisabled : null,
+                      ]}
+                    >
+                      {isUpdatingLessonCompletion ? (
+                        <ActivityIndicator color={theme.colors.brandBlueDeep} size="small" />
+                      ) : (
+                        <Ionicons
+                          color={theme.colors.brandBlueDeep}
+                          name={selectedLesson.completed ? 'checkmark-circle' : 'ellipse-outline'}
+                          size={18}
+                        />
+                      )}
+                      <Text style={styles.lessonCompletionButtonText}>
+                        {selectedLesson.completed ? 'Afgerond, tik om terug te zetten' : 'Markeer als afgerond'}
+                      </Text>
+                    </Pressable>
+                  ) : null}
+                  {selectedLesson.description ? (
+                    <View style={styles.modalInfoBlock}>
+                      <Text style={styles.modalInfoTitle}>{getInfoLabel(selectedLesson)}</Text>
+                      <Text style={styles.modalInfoText}>{selectedLesson.description}</Text>
+                    </View>
+                  ) : null}
+                  {selectedLesson.hasAttachments ? (
+                    <Text style={styles.modalAttachment}>Deze les heeft ook bijlagen in Magister.</Text>
+                  ) : null}
+                </>
+              ) : null}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        animationType="fade"
+        onRequestClose={() => setSelectedLocationLesson(null)}
+        presentationStyle="overFullScreen"
+        statusBarTranslucent
+        transparent
+        visible={Boolean(selectedLocationLesson)}
+      >
+        <View style={styles.modalScrim}>
+          <View style={[styles.modalCard, styles.locationModalCard]}>
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>{selectedLesson ? getLessonHeading(selectedLesson).title : ''}</Text>
-              <Pressable onPress={() => setSelectedLesson(null)} style={styles.modalClose}>
+              <View style={styles.locationModalTitleWrap}>
+                <Text style={[styles.modalTitle, styles.locationModalTitle]}>
+                  {formatDisplayLocation(selectedLocationLesson?.location) || 'Locatie'}
+                </Text>
+                {selectedLocationLesson ? (
+                  <Text style={styles.modalMeta}>
+                    {formatTime(selectedLocationLesson.start)} - {formatTime(selectedLocationLesson.end)} |{' '}
+                    {getLessonHeading(selectedLocationLesson).title}
+                  </Text>
+                ) : null}
+              </View>
+              <Pressable onPress={() => setSelectedLocationLesson(null)} style={styles.modalClose}>
                 <Ionicons color={theme.colors.brandBlueDeep} name="close" size={20} />
               </Pressable>
             </View>
-            {selectedLesson ? (
-              <>
-                {getLessonHeading(selectedLesson).subtitle ? (
-                  <Text style={styles.modalMeta}>{getLessonHeading(selectedLesson).subtitle}</Text>
-                ) : null}
-                <Text style={styles.modalMeta}>
-                  {formatTime(selectedLesson.start)} - {formatTime(selectedLesson.end)} | {selectedLesson.location}
-                </Text>
-                <Text style={styles.modalMeta}>{selectedLesson.teachers}</Text>
-                {selectedLesson.description ? (
-                  <View style={styles.modalInfoBlock}>
-                    <Text style={styles.modalInfoTitle}>{getInfoLabel(selectedLesson)}</Text>
-                    <Text style={styles.modalInfoText}>{selectedLesson.description}</Text>
-                  </View>
-                ) : null}
-                {selectedLesson.hasAttachments ? (
-                  <Text style={styles.modalAttachment}>Deze les heeft ook bijlagen in Magister.</Text>
-                ) : null}
-              </>
+            {selectedLocationLesson ? (
+              selectedLocationFloorPlanMatch ? (
+                <FloorPlanViewer
+                  animationKey={
+                    selectedLocationLesson
+                      ? `${selectedLocationLesson.id}:${selectedLocationLesson.start}`
+                      : undefined
+                  }
+                  autoFocusEnabled
+                  match={selectedLocationFloorPlanMatch}
+                />
+              ) : (
+                <View style={styles.mapEmptyState}>
+                  <Text style={styles.mapEmptyTitle}>
+                    Nog geen locatie ingesteld voor {formatDisplayLocation(selectedLocationLesson.location) || 'deze locatie'}
+                  </Text>
+                  <Text style={styles.mapEmptyText}>
+                    Voeg dit lokaal toe in `src/data/floorPlans.json` of gebruik de editor in `tools/floorplan-editor`.
+                  </Text>
+                </View>
+              )
             ) : null}
           </View>
         </View>
@@ -910,6 +1604,17 @@ const styles = StyleSheet.create({
   dayChipMetaActive: {
     color: 'rgba(255,255,255,0.8)',
   },
+  studyDayChip: {
+    minHeight: 84,
+    paddingHorizontal: 6,
+  },
+  studyDayChipMeta: {
+    color: theme.colors.textSoft,
+    fontFamily: theme.fonts.bold,
+    fontSize: 11,
+    marginTop: 6,
+    textAlign: 'center',
+  },
   stateCard: {
     alignItems: 'center',
     backgroundColor: theme.colors.paper,
@@ -975,20 +1680,25 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   lessonTopRow: {
-    alignItems: 'flex-start',
-    flexDirection: 'row',
-    justifyContent: 'space-between',
+    minHeight: 104,
+    position: 'relative',
   },
   lessonCopy: {
     flex: 1,
     minWidth: 0,
-    paddingRight: 10,
+    paddingRight: 154,
   },
-  lessonBadgeColumn: {
+  lessonSidebar: {
     alignItems: 'flex-end',
     flexShrink: 0,
-    marginLeft: 10,
-    width: 104,
+    gap: 8,
+    position: 'absolute',
+    right: 0,
+    top: 0,
+  },
+  lessonSidebarBadges: {
+    alignItems: 'flex-end',
+    gap: 8,
   },
   lessonTitle: {
     color: theme.colors.brandBlueDeep,
@@ -1001,6 +1711,7 @@ const styles = StyleSheet.create({
     fontFamily: theme.fonts.bold,
     fontSize: 12,
     marginTop: 5,
+    paddingRight: 0,
     textTransform: 'uppercase',
   },
   lessonTitleCancelled: {
@@ -1012,13 +1723,15 @@ const styles = StyleSheet.create({
   lessonBadge: {
     backgroundColor: '#EDF4FF',
     borderRadius: 10,
+    maxWidth: 134,
     paddingHorizontal: 12,
     paddingVertical: 9,
   },
   lessonBadgeText: {
     color: theme.colors.brandBlue,
     fontFamily: theme.fonts.heavy,
-    fontSize: 13,
+    fontSize: 12,
+    textAlign: 'center',
   },
   lessonBadgeCancelled: {
     backgroundColor: '#FCE8E7',
@@ -1029,7 +1742,6 @@ const styles = StyleSheet.create({
   lessonInfoBadge: {
     backgroundColor: '#EDF4FF',
     borderRadius: 10,
-    marginTop: 8,
     paddingHorizontal: 12,
     paddingVertical: 7,
   },
@@ -1050,10 +1762,15 @@ const styles = StyleSheet.create({
   lessonInfoBadgeTextCancelled: {
     color: '#536479',
   },
+  lessonWalkButton: {
+    alignItems: 'center',
+    height: 40,
+    justifyContent: 'center',
+    width: 40,
+  },
   lessonCancelledBadge: {
     backgroundColor: '#FCE8E7',
     borderRadius: 10,
-    marginTop: 8,
     paddingHorizontal: 12,
     paddingVertical: 7,
   },
@@ -1062,12 +1779,29 @@ const styles = StyleSheet.create({
     fontFamily: theme.fonts.bold,
     fontSize: 12,
   },
+  lessonTypeBadge: {
+    backgroundColor: '#E9EDF3',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  lessonTypeBadgeText: {
+    color: '#5B6678',
+    fontFamily: theme.fonts.bold,
+    fontSize: 12,
+  },
   lessonMeta: {
     color: theme.colors.textSoft,
     fontFamily: theme.fonts.medium,
-    fontSize: 14,
-    lineHeight: 20,
-    marginTop: 10,
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 7,
+  },
+  lessonBadgeRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 12,
   },
   lessonMetaCancelled: {
     color: '#7A8697',
@@ -1083,7 +1817,7 @@ const styles = StyleSheet.create({
     fontFamily: theme.fonts.medium,
     fontSize: 14,
     lineHeight: 20,
-    marginTop: 12,
+    marginTop: 10,
   },
   lessonPreviewCancelled: {
     color: '#607184',
@@ -1113,6 +1847,59 @@ const styles = StyleSheet.create({
     fontFamily: theme.fonts.bold,
     fontSize: 13,
     textAlign: 'center',
+  },
+  activityCard: {
+    backgroundColor: theme.colors.paper,
+    borderColor: theme.colors.divider,
+    borderRadius: 18,
+    borderWidth: 1,
+    padding: 16,
+  },
+  activityCardHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+  },
+  activityIconWrap: {
+    alignItems: 'center',
+    backgroundColor: '#EDF4FF',
+    borderRadius: 12,
+    height: 42,
+    justifyContent: 'center',
+    width: 42,
+  },
+  activityCopy: {
+    flex: 1,
+    minWidth: 0,
+  },
+  activityTitle: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.heavy,
+    fontSize: 18,
+    lineHeight: 24,
+  },
+  activityMeta: {
+    color: theme.colors.brandBlue,
+    fontFamily: theme.fonts.bold,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 6,
+    textTransform: 'uppercase',
+  },
+  activityDescription: {
+    color: theme.colors.text,
+    fontFamily: theme.fonts.medium,
+    fontSize: 14,
+    lineHeight: 20,
+    marginTop: 12,
+  },
+  activityFooter: {
+    marginTop: 14,
+  },
+  activityFooterText: {
+    color: theme.colors.textSoft,
+    fontFamily: theme.fonts.bold,
+    fontSize: 13,
   },
   agendaDayCard: {
     backgroundColor: theme.colors.paper,
@@ -1176,6 +1963,119 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     marginTop: 10,
   },
+  studyItem: {
+    backgroundColor: '#F9FBFE',
+    borderColor: theme.colors.divider,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginTop: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+  },
+  studyItemHeader: {
+    minHeight: 96,
+    position: 'relative',
+  },
+  studyItemSidebar: {
+    alignItems: 'flex-end',
+    flexShrink: 0,
+    gap: 8,
+    position: 'absolute',
+    right: 0,
+    top: 0,
+  },
+  studyItemCopy: {
+    flex: 1,
+    minWidth: 0,
+    paddingRight: 154,
+  },
+  studyItemTitle: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.bold,
+    fontSize: 15,
+    lineHeight: 20,
+  },
+  studyItemSubtitle: {
+    color: theme.colors.brandBlue,
+    fontFamily: theme.fonts.bold,
+    fontSize: 12,
+    lineHeight: 16,
+    marginTop: 4,
+    textTransform: 'uppercase',
+  },
+  studyBadge: {
+    backgroundColor: '#EDF4FF',
+    borderRadius: 10,
+    minWidth: 84,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  studyBadgeDark: {
+    backgroundColor: theme.colors.brandBlueDeep,
+  },
+  studyBadgeCompleted: {
+    paddingBottom: 8,
+  },
+  studyBadgeText: {
+    color: theme.colors.brandBlue,
+    fontFamily: theme.fonts.bold,
+    fontSize: 11,
+    textAlign: 'center',
+  },
+  studyBadgeTextDark: {
+    color: theme.colors.inkOnDark,
+  },
+  studyBadgeTextCompleted: {
+    color: theme.colors.brandBlueDeep,
+  },
+  studyBadgeDivider: {
+    alignSelf: 'stretch',
+    backgroundColor: 'rgba(38, 77, 151, 0.18)',
+    height: 1,
+    marginTop: 6,
+  },
+  studyBadgeFooterText: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.bold,
+    fontSize: 11,
+    marginTop: 6,
+    textAlign: 'center',
+  },
+  studyItemMeta: {
+    color: theme.colors.textSoft,
+    fontFamily: theme.fonts.medium,
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 7,
+  },
+  studyItemDescription: {
+    color: theme.colors.text,
+    fontFamily: theme.fonts.medium,
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 10,
+  },
+  studyProgressRow: {
+    alignItems: 'center',
+    backgroundColor: '#F4F8FF',
+    borderRadius: 14,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  studyProgressLabel: {
+    color: theme.colors.textSoft,
+    fontFamily: theme.fonts.bold,
+    fontSize: 13,
+    textTransform: 'uppercase',
+  },
+  studyProgressValue: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.heavy,
+    fontSize: 16,
+  },
   modalScrim: {
     alignItems: 'center',
     backgroundColor: 'rgba(14, 27, 51, 0.42)',
@@ -1188,6 +2088,7 @@ const styles = StyleSheet.create({
   },
   modalCard: {
     backgroundColor: theme.colors.paper,
+    maxHeight: '88%',
     borderRadius: 24,
     maxWidth: 720,
     padding: 20,
@@ -1200,10 +2101,11 @@ const styles = StyleSheet.create({
   },
   modalTitle: {
     color: theme.colors.brandBlueDeep,
-    flex: 1,
+    flexShrink: 1,
     fontFamily: theme.fonts.heavy,
     fontSize: 24,
-    lineHeight: 30,
+    lineHeight: 32,
+    minWidth: 0,
     paddingRight: 14,
   },
   modalClose: {
@@ -1220,6 +2122,28 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 20,
     marginTop: 10,
+  },
+  lessonCompletionButton: {
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    backgroundColor: '#EDF4FF',
+    borderRadius: 12,
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 16,
+    minHeight: 44,
+    paddingHorizontal: 14,
+  },
+  lessonCompletionButtonActive: {
+    backgroundColor: '#E8F6F1',
+  },
+  lessonCompletionButtonDisabled: {
+    opacity: 0.7,
+  },
+  lessonCompletionButtonText: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.bold,
+    fontSize: 13,
   },
   modalInfoBlock: {
     backgroundColor: '#F7FAFF',
@@ -1246,6 +2170,39 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     marginTop: 14,
+  },
+  locationModalCard: {
+    maxWidth: 1120,
+    paddingBottom: 18,
+  },
+  locationModalTitleWrap: {
+    flex: 1,
+    minWidth: 0,
+    paddingRight: 14,
+  },
+  locationModalTitle: {
+    paddingRight: 0,
+  },
+  mapEmptyState: {
+    backgroundColor: '#F7FAFF',
+    borderColor: theme.colors.divider,
+    borderRadius: 18,
+    borderWidth: 1,
+    marginTop: 18,
+    padding: 16,
+  },
+  mapEmptyTitle: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.bold,
+    fontSize: 15,
+    lineHeight: 21,
+  },
+  mapEmptyText: {
+    color: theme.colors.textSoft,
+    fontFamily: theme.fonts.medium,
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 8,
   },
   reminderRow: {
     alignItems: 'center',

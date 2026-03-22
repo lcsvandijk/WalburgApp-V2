@@ -108,6 +108,88 @@ function mapTokenSet(tokenSet: Record<string, unknown>, fallbackIdToken?: string
   };
 }
 
+function decodeJwtPayload(token?: string) {
+  if (!token) {
+    return null;
+  }
+
+  const segments = token.split('.');
+
+  if (segments.length < 2) {
+    return null;
+  }
+
+  try {
+    const normalized = segments[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const cleanBase64 = padded.replace(/=+$/g, '');
+    const bytes: number[] = [];
+
+    for (let index = 0; index < cleanBase64.length; index += 4) {
+      const chunk = cleanBase64.slice(index, index + 4);
+      const values = chunk.split('').map((character) => alphabet.indexOf(character));
+
+      if (values.some((value) => value < 0)) {
+        return null;
+      }
+
+      const first = (values[0] << 2) | (values[1] >> 4);
+      bytes.push(first & 255);
+
+      if (values.length > 2) {
+        const second = ((values[1] & 15) << 4) | (values[2] >> 2);
+        bytes.push(second & 255);
+      }
+
+      if (values.length > 3) {
+        const third = ((values[2] & 3) << 6) | values[3];
+        bytes.push(third & 255);
+      }
+    }
+
+    const decoded = new TextDecoder('utf-8').decode(new Uint8Array(bytes));
+
+    return JSON.parse(decoded) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+export function extractAttendanceStudentId(tokenSet: Pick<MagisterTokenSet, 'accessToken' | 'idToken'>) {
+  const payloads = [decodeJwtPayload(tokenSet.idToken), decodeJwtPayload(tokenSet.accessToken)].filter(
+    (payload): payload is Record<string, unknown> => Boolean(payload),
+  );
+  const candidates = payloads.flatMap((payload) => [
+    payload.sub,
+    payload.oid,
+    payload.sid,
+    payload.nameid,
+    payload.legacy_user_id,
+    payload.legacyuserid,
+    payload.student_id,
+    payload.studentid,
+    payload.attendance_student_id,
+    payload.attendancestudentid,
+    payload['http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier'],
+    ...Object.values(payload),
+  ]);
+
+  for (const rawValue of candidates) {
+    if (typeof rawValue !== 'string') {
+      continue;
+    }
+
+    const normalized = rawValue.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+
+    if (normalized.length >= 24) {
+      return normalized;
+    }
+  }
+
+  return undefined;
+}
+
 export async function loginWithMagisterOAuth(usernameHint?: string) {
   if (Platform.OS === 'web') {
     throw new Error('Deze Magister OAuth-flow werkt alleen in een native build op iPhone of Android.');

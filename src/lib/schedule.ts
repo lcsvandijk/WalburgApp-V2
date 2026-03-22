@@ -77,6 +77,7 @@ function comparableKey(appointment: MagisterAppointment) {
     appointment.subject,
     appointment.location,
     appointment.teachers,
+    appointment.type != null ? String(appointment.type) : 'unknown',
     isAssessmentAppointment(appointment) ? 'assessment' : 'lesson',
     appointment.isCancelled ? 'cancelled' : 'active',
     appointment.isAllDay ? 'all-day' : 'timed',
@@ -122,6 +123,9 @@ function mergeAppointments(left: MagisterAppointment, right: MagisterAppointment
     description: mergeDescription(left.description, right.description),
     infoType: mergedInfoType,
     hasAttachments: Boolean(left.hasAttachments || right.hasAttachments),
+    status: left.status ?? right.status ?? null,
+    type: left.type ?? right.type ?? null,
+    subtype: left.subtype ?? right.subtype ?? null,
   };
 }
 

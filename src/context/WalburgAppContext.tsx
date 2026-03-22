@@ -1,11 +1,28 @@
 import { createContext, PropsWithChildren, useCallback, useContext, useEffect, useRef, useState } from 'react';
 
+import {
+  getDemoAppointments,
+  getDemoGrades,
+  getDemoSession,
+  getDemoSubjectAverages,
+} from '../data/demoContent';
 import { getScheduleRange } from '../lib/date';
-import { loginWithMagisterOAuth, refreshMagisterAccessToken } from '../services/magisterAuth';
+import { loadDemoSchoolAgenda } from '../services/demoContent';
+import {
+  ensureNotificationPermissionsAsync,
+  initializeNotificationsAsync,
+  notifyAboutNewGrades,
+  notifyAboutNewMessages,
+  notifyAboutScheduleUpdates,
+  scheduleLessonReminderNotifications,
+} from '../services/notifications';
+import { extractAttendanceStudentId, loginWithMagisterOAuth, refreshMagisterAccessToken } from '../services/magisterAuth';
 import {
   calculateSubjectAveragesFromGrades,
   fetchAccountFromTokens,
+  fetchInboxMessagesFromTokens,
   fetchLatestGradesFromTokens,
+  updateAppointmentCompletionFromTokens,
   fetchScheduleFromTokens,
   fetchScheduleChangesFromTokens,
   normalizeAppointments,
@@ -21,14 +38,17 @@ import {
   saveStoredMagisterCache,
   saveStoredSession,
 } from '../services/storage';
+import { loadSchoolAgenda } from '../services/walburgContent';
 import { AppPreferences } from '../types/content';
 import {
   MagisterAppointment,
   MagisterGradeResult,
+  MagisterMessageSummary,
   MagisterSubjectAverage,
   StoredMagisterCache,
   StoredSession,
 } from '../types/magister';
+import { syncWalburgWidgets } from '../widgets/syncWalburgWidgets';
 
 type ManualTokenValues = {
   accessToken: string;
@@ -39,10 +59,13 @@ type ManualTokenValues = {
 interface WalburgAppContextValue {
   appointments: MagisterAppointment[];
   grades: MagisterGradeResult[];
+  inboxPreview: MagisterMessageSummary[];
   subjectAverages: MagisterSubjectAverage[];
   preferences: AppPreferences;
+  isDemoMode: boolean;
   isBusy: boolean;
   isHydrating: boolean;
+  unreadInboxCount: number;
   session: StoredSession | null;
   errorMessage: string | null;
   clearError: () => void;
@@ -50,16 +73,20 @@ interface WalburgAppContextValue {
   connectWithManualTokens: (values: ManualTokenValues) => Promise<void>;
   logout: () => Promise<void>;
   refreshAppData: () => Promise<void>;
+  refreshInbox: () => Promise<void>;
   refreshSchedule: () => Promise<void>;
   ensureScheduleRangeLoaded: (from: string, to: string) => Promise<void>;
   updatePreferences: (
     value: Partial<AppPreferences> | ((current: AppPreferences) => AppPreferences),
   ) => Promise<void>;
   toggleAgendaReminder: (eventId: string) => Promise<void>;
+  markMessageReadLocally: (messageId: number) => void;
+  setAppointmentCompletion: (appointmentId: string, completed: boolean) => Promise<MagisterAppointment | null>;
 }
 
 const WalburgAppContext = createContext<WalburgAppContextValue | null>(null);
 const MAGISTER_REFRESH_WINDOW_MS = 120_000;
+const MAIL_POLL_INTERVAL_MS = 30_000;
 
 type CacheMeta = {
   personId: number;
@@ -80,15 +107,42 @@ function mergeAppointments(current: MagisterAppointment[], incoming: MagisterApp
   );
 }
 
+function countUnreadMessages(messages: MagisterMessageSummary[]) {
+  return messages.filter((message) => !message.isRead).length;
+}
+
+function haveMessagesChanged(previousMessages: MagisterMessageSummary[], nextMessages: MagisterMessageSummary[]) {
+  if (previousMessages.length !== nextMessages.length) {
+    return true;
+  }
+
+  return previousMessages.some((message, index) => {
+    const nextMessage = nextMessages[index];
+
+    return (
+      !nextMessage ||
+      message.id !== nextMessage.id ||
+      message.isRead !== nextMessage.isRead ||
+      message.sentAt !== nextMessage.sentAt
+    );
+  });
+}
+
 export function WalburgAppProvider({ children }: PropsWithChildren) {
   const [session, setSession] = useState<StoredSession | null>(null);
   const [appointments, setAppointments] = useState<MagisterAppointment[]>([]);
   const [grades, setGrades] = useState<MagisterGradeResult[]>([]);
+  const [inboxPreview, setInboxPreview] = useState<MagisterMessageSummary[]>([]);
   const [subjectAverages, setSubjectAverages] = useState<MagisterSubjectAverage[]>([]);
   const [preferences, setPreferences] = useState<AppPreferences>({
+    mailNotificationsEnabled: true,
+    priorityMailOnlyNotifications: false,
     agendaAutoAddEnabled: false,
     agendaReminders: false,
+    demoModeEnabled: false,
     gradeNotifications: true,
+    lessonRemindersEnabled: false,
+    onboardingCompleted: false,
     roundAveragesToWholeNumbers: false,
     savedReminderEventIds: [],
     scheduleChangeNotifications: true,
@@ -100,6 +154,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
   const shouldBootstrapSyncRef = useRef(false);
   const appointmentsRef = useRef<MagisterAppointment[]>([]);
   const gradesRef = useRef<MagisterGradeResult[]>([]);
+  const inboxPreviewRef = useRef<MagisterMessageSummary[]>([]);
   const subjectAveragesRef = useRef<MagisterSubjectAverage[]>([]);
 
   useEffect(() => {
@@ -109,6 +164,10 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
   useEffect(() => {
     gradesRef.current = grades;
   }, [grades]);
+
+  useEffect(() => {
+    inboxPreviewRef.current = inboxPreview;
+  }, [inboxPreview]);
 
   useEffect(() => {
     subjectAveragesRef.current = subjectAverages;
@@ -139,15 +198,27 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
           return;
         }
 
-        setSession(storedSession);
+        const hydratedSession =
+          storedSession && !storedSession.attendanceStudentId && storedSession.accessToken
+            ? {
+                ...storedSession,
+                attendanceStudentId: extractAttendanceStudentId({
+                  accessToken: storedSession.accessToken,
+                  idToken: storedSession.idToken,
+                }),
+              }
+            : storedSession;
+
+        setSession(hydratedSession);
         setPreferences(storedPreferences);
         if (
-          storedSession &&
+          hydratedSession &&
           storedCache &&
-          storedCache.personId === (storedSession.personId ?? storedSession.id)
+          storedCache.personId === (hydratedSession.personId ?? hydratedSession.id)
         ) {
           setAppointments(storedCache.appointments);
           setGrades(storedCache.grades);
+          setInboxPreview(storedCache.inboxPreview ?? []);
           setSubjectAverages(storedCache.subjectAverages);
           setCacheMeta({
             personId: storedCache.personId,
@@ -158,16 +229,20 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
         }
 
         const hasFreshCache =
-          storedSession &&
+          hydratedSession &&
           storedCache &&
-          storedCache.personId === (storedSession.personId ?? storedSession.id) &&
+          storedCache.personId === (hydratedSession.personId ?? hydratedSession.id) &&
           Date.now() - new Date(storedCache.cachedAt).getTime() < MAGISTER_REFRESH_WINDOW_MS;
 
         shouldBootstrapSyncRef.current = Boolean(
-          storedSession?.hasApiAccess &&
-          storedSession.accessToken &&
+          hydratedSession?.hasApiAccess &&
+          hydratedSession.accessToken &&
           !hasFreshCache,
         );
+
+        if (hydratedSession && hydratedSession !== storedSession) {
+          await saveStoredSession(hydratedSession);
+        }
       } catch (error) {
         if (active) {
           setErrorMessage(error instanceof Error ? error.message : 'Opslaan van de sessie mislukte.');
@@ -198,6 +273,93 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
     });
   }, [isHydrating, session?.accessToken, session?.hasApiAccess]);
 
+  const isDemoMode = preferences.demoModeEnabled;
+  const demoSession = getDemoSession();
+  const effectiveSession = isDemoMode ? demoSession : session;
+  const effectiveAppointments = isDemoMode ? getDemoAppointments() : appointments;
+  const effectiveGrades = isDemoMode ? getDemoGrades() : grades;
+  const effectiveInboxPreview = isDemoMode ? [] : inboxPreview;
+  const effectiveSubjectAverages = isDemoMode ? getDemoSubjectAverages() : subjectAverages;
+
+  useEffect(() => {
+    initializeNotificationsAsync().catch(() => {
+      return;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (isHydrating) {
+      return;
+    }
+
+    if (
+      !preferences.gradeNotifications &&
+      !preferences.mailNotificationsEnabled &&
+      !preferences.scheduleChangeNotifications &&
+      !preferences.lessonRemindersEnabled
+    ) {
+      return;
+    }
+
+    ensureNotificationPermissionsAsync().catch(() => {
+      return;
+    });
+  }, [
+    isHydrating,
+    preferences.gradeNotifications,
+    preferences.lessonRemindersEnabled,
+    preferences.mailNotificationsEnabled,
+    preferences.scheduleChangeNotifications,
+  ]);
+
+  useEffect(() => {
+    if (isHydrating) {
+      return;
+    }
+
+    let active = true;
+
+    async function syncWidgets() {
+      try {
+        const agendaItems = await (isDemoMode ? loadDemoSchoolAgenda() : loadSchoolAgenda());
+
+        if (!active) {
+          return;
+        }
+
+        await syncWalburgWidgets({
+          agendaItems,
+          appointments: effectiveAppointments,
+          grades: effectiveGrades,
+          isDemoMode,
+        });
+      } catch {
+        // Widgets blijven optioneel: de app zelf hoeft hier niet op te stranden.
+      }
+    }
+
+    syncWidgets().catch(() => {
+      return;
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [effectiveAppointments, effectiveGrades, isDemoMode, isHydrating]);
+
+  useEffect(() => {
+    if (isHydrating) {
+      return;
+    }
+
+    scheduleLessonReminderNotifications(
+      effectiveAppointments,
+      preferences.lessonRemindersEnabled && !isDemoMode,
+    ).catch(() => {
+      return;
+    });
+  }, [effectiveAppointments, isDemoMode, isHydrating, preferences.lessonRemindersEnabled]);
+
   const ensureFreshSession = useCallback(async (activeSession: StoredSession) => {
     if (
       activeSession.authMode !== 'oauth' ||
@@ -212,6 +374,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
     const nextSession: StoredSession = {
       ...activeSession,
       ...refreshedTokenSet,
+      attendanceStudentId: extractAttendanceStudentId(refreshedTokenSet) ?? activeSession.attendanceStudentId,
       idToken: refreshedTokenSet.idToken ?? activeSession.idToken,
     };
 
@@ -264,6 +427,18 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
     };
   }, [ensureFreshSession]);
 
+  const loadInboxForSession = useCallback(async (activeSession: StoredSession) => {
+    const refreshedSession = await ensureFreshSession(activeSession);
+    const messages = await fetchInboxMessagesFromTokens(refreshedSession, { top: 50, skip: 0 }).catch(() => []);
+
+    setInboxPreview(messages);
+
+    return {
+      inboxPreview: messages,
+      refreshedSession,
+    };
+  }, [ensureFreshSession]);
+
   const persistRefreshedSession = useCallback(async (activeSession: StoredSession) => {
     const nextSession = {
       ...activeSession,
@@ -276,14 +451,100 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
     return nextSession;
   }, []);
 
-  const refreshRange = useCallback(async (from: string, to: string, options?: { includeGrades?: boolean; merge?: boolean }) => {
+  useEffect(() => {
+    if (
+      isHydrating ||
+      preferences.demoModeEnabled ||
+      !preferences.mailNotificationsEnabled ||
+      !session?.accessToken
+    ) {
+      return;
+    }
+
+    let active = true;
+    let isPolling = false;
+
+    const pollInbox = async () => {
+      if (!active || isPolling) {
+        return;
+      }
+
+      isPolling = true;
+      const previousMessages = inboxPreviewRef.current;
+
+      try {
+        const inboxResult = await loadInboxForSession(session);
+        const nextMessages = inboxResult.inboxPreview;
+
+        if (!active || !haveMessagesChanged(previousMessages, nextMessages)) {
+          return;
+        }
+
+        await notifyAboutNewMessages(
+          previousMessages,
+          nextMessages,
+          preferences.mailNotificationsEnabled,
+          preferences.priorityMailOnlyNotifications,
+        ).catch(() => {
+          return;
+        });
+
+        const refreshedSession = await persistRefreshedSession(inboxResult.refreshedSession);
+        await persistMagisterCache({
+          personId: refreshedSession.personId ?? refreshedSession.id,
+          cachedAt: new Date().toISOString(),
+          scheduleFrom: cacheMeta?.scheduleFrom,
+          scheduleTo: cacheMeta?.scheduleTo,
+          appointments: appointmentsRef.current,
+          grades: gradesRef.current,
+          inboxPreview: nextMessages,
+          subjectAverages: subjectAveragesRef.current,
+        });
+      } catch {
+        return;
+      } finally {
+        isPolling = false;
+      }
+    };
+
+    const intervalId = setInterval(() => {
+      pollInbox().catch(() => {
+        return;
+      });
+    }, MAIL_POLL_INTERVAL_MS);
+
+    return () => {
+      active = false;
+      clearInterval(intervalId);
+    };
+  }, [
+    cacheMeta?.scheduleFrom,
+    cacheMeta?.scheduleTo,
+    isHydrating,
+    loadInboxForSession,
+    persistMagisterCache,
+    persistRefreshedSession,
+    preferences.demoModeEnabled,
+    preferences.mailNotificationsEnabled,
+    preferences.priorityMailOnlyNotifications,
+    session,
+  ]);
+
+  const refreshRange = useCallback(async (
+    from: string,
+    to: string,
+    options?: { includeGrades?: boolean; includeInbox?: boolean; merge?: boolean; allowNotifications?: boolean; force?: boolean },
+  ) => {
     if (!session?.accessToken) {
       setErrorMessage('Deze sessie kan niet automatisch verversen. Log opnieuw in of gebruik een nieuw token.');
       return;
     }
 
     const includeGrades = options?.includeGrades ?? false;
+    const includeInbox = options?.includeInbox ?? false;
     const merge = options?.merge ?? false;
+    const allowNotifications = options?.allowNotifications ?? false;
+    const force = options?.force ?? false;
     const requestedPersonId = session.personId ?? session.id;
     const cacheIsFresh =
       cacheMeta?.personId === requestedPersonId &&
@@ -293,7 +554,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
       from >= (cacheMeta?.scheduleFrom ?? '') &&
       to <= (cacheMeta?.scheduleTo ?? '');
 
-    if (cacheIsFresh && requestedRangeCovered) {
+    if (!force && cacheIsFresh && requestedRangeCovered) {
       return;
     }
 
@@ -303,6 +564,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
       ? mergeAppointments(appointmentsRef.current, scheduleResult.appointments)
       : scheduleResult.appointments;
     let nextGrades = gradesRef.current;
+    let nextInboxPreview = inboxPreviewRef.current;
     let nextSubjectAverages = subjectAveragesRef.current;
 
     if (includeGrades) {
@@ -310,6 +572,39 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
       refreshedSession = gradesResult.refreshedSession;
       nextGrades = gradesResult.grades;
       nextSubjectAverages = gradesResult.subjectAverages;
+    }
+
+    if (includeInbox) {
+      const inboxResult = await loadInboxForSession(refreshedSession);
+      refreshedSession = inboxResult.refreshedSession;
+      nextInboxPreview = inboxResult.inboxPreview;
+    }
+
+    if (allowNotifications) {
+      await Promise.all([
+        notifyAboutScheduleUpdates(
+          appointmentsRef.current,
+          nextAppointments,
+          preferences.scheduleChangeNotifications,
+        ).catch(() => {
+          return;
+        }),
+        includeGrades
+          ? notifyAboutNewGrades(gradesRef.current, nextGrades, preferences.gradeNotifications).catch(() => {
+              return;
+            })
+          : Promise.resolve(),
+        includeInbox
+          ? notifyAboutNewMessages(
+              inboxPreviewRef.current,
+              nextInboxPreview,
+              preferences.mailNotificationsEnabled,
+              preferences.priorityMailOnlyNotifications,
+            ).catch(() => {
+              return;
+            })
+          : Promise.resolve(),
+      ]);
     }
 
     await persistRefreshedSession(refreshedSession);
@@ -322,9 +617,22 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
         merge && cacheMeta?.scheduleTo && cacheMeta.scheduleTo > to ? cacheMeta.scheduleTo : to,
       appointments: nextAppointments,
       grades: nextGrades,
+      inboxPreview: nextInboxPreview,
       subjectAverages: nextSubjectAverages,
     });
-  }, [loadGradesForSession, loadScheduleForSession, persistRefreshedSession, session]);
+  }, [
+    cacheMeta,
+    loadGradesForSession,
+    loadInboxForSession,
+    loadScheduleForSession,
+    persistMagisterCache,
+    persistRefreshedSession,
+    preferences.gradeNotifications,
+    preferences.mailNotificationsEnabled,
+    preferences.priorityMailOnlyNotifications,
+    preferences.scheduleChangeNotifications,
+    session,
+  ]);
 
   const loginWithMagister = useCallback(async (usernameHint?: string) => {
     setIsBusy(true);
@@ -335,10 +643,11 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
       const account = await fetchAccountFromTokens(tokenSet);
       const profile = toProfile(account);
       const range = getScheduleRange();
-      const [schedule, scheduleChanges, latestGrades] = await Promise.all([
+      const [schedule, scheduleChanges, latestGrades, inboxMessages] = await Promise.all([
         fetchScheduleFromTokens(tokenSet, profile.id, range.from, range.to),
         fetchScheduleChangesFromTokens(tokenSet, profile.id, range.from, range.to).catch(() => null),
         fetchLatestGradesFromTokens(tokenSet, profile.id).catch(() => []),
+        fetchInboxMessagesFromTokens(tokenSet, { top: 50, skip: 0 }).catch(() => []),
       ]);
       const averages = calculateSubjectAveragesFromGrades(latestGrades);
       const normalizedSchedule = normalizeAppointments(schedule, scheduleChanges);
@@ -346,6 +655,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
       const nextSession: StoredSession = {
         ...profile,
         ...tokenSet,
+        attendanceStudentId: extractAttendanceStudentId(tokenSet),
         authMode: 'oauth',
         hasApiAccess: true,
         lastSyncedAt: new Date().toISOString(),
@@ -353,6 +663,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
 
       setAppointments(normalizedSchedule);
       setGrades(latestGrades);
+      setInboxPreview(inboxMessages);
       setSubjectAverages(averages);
       setSession(nextSession);
       await saveStoredSession(nextSession);
@@ -363,6 +674,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
         scheduleTo: range.to,
         appointments: normalizedSchedule,
         grades: latestGrades,
+        inboxPreview: inboxMessages,
         subjectAverages: averages,
       });
     } catch (error) {
@@ -393,10 +705,11 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
         accessToken: sanitizedAccessToken,
         xsrfToken: sanitizedXsrfToken,
       };
-      const [schedule, scheduleChanges, latestGrades] = await Promise.all([
+      const [schedule, scheduleChanges, latestGrades, inboxMessages] = await Promise.all([
         fetchScheduleFromTokens(manualTokenSet, resolvedPersonId, range.from, range.to),
         fetchScheduleChangesFromTokens(manualTokenSet, resolvedPersonId, range.from, range.to).catch(() => null),
         fetchLatestGradesFromTokens(manualTokenSet, resolvedPersonId).catch(() => []),
+        fetchInboxMessagesFromTokens(manualTokenSet, { top: 50, skip: 0 }).catch(() => []),
       ]);
       const averages = calculateSubjectAveragesFromGrades(latestGrades);
       const normalizedSchedule = normalizeAppointments(schedule, scheduleChanges);
@@ -407,6 +720,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
         personId: resolvedPersonId,
         accessToken: sanitizedAccessToken,
         xsrfToken: sanitizedXsrfToken,
+        attendanceStudentId: extractAttendanceStudentId({ accessToken: sanitizedAccessToken }),
         authMode: 'manual',
         hasApiAccess: true,
         lastSyncedAt: new Date().toISOString(),
@@ -414,6 +728,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
 
       setAppointments(normalizedSchedule);
       setGrades(latestGrades);
+      setInboxPreview(inboxMessages);
       setSubjectAverages(averages);
       setSession(nextSession);
       await saveStoredSession(nextSession);
@@ -424,6 +739,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
         scheduleTo: range.to,
         appointments: normalizedSchedule,
         grades: latestGrades,
+        inboxPreview: inboxMessages,
         subjectAverages: averages,
       });
     } catch (error) {
@@ -435,38 +751,111 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
   }, []);
 
   const refreshAppData = useCallback(async () => {
+    if (preferences.demoModeEnabled) {
+      return;
+    }
+
     const range = getScheduleRange();
 
     setIsBusy(true);
     setErrorMessage(null);
 
     try {
-      await refreshRange(range.from, range.to, { includeGrades: true, merge: false });
+      await refreshRange(range.from, range.to, {
+        allowNotifications: true,
+        force: true,
+        includeGrades: true,
+        includeInbox: true,
+        merge: false,
+      });
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : 'Synchroniseren mislukte.');
       throw error;
     } finally {
       setIsBusy(false);
     }
-  }, [refreshRange]);
+  }, [preferences.demoModeEnabled, refreshRange]);
 
   const refreshSchedule = useCallback(async () => {
+    if (preferences.demoModeEnabled) {
+      return;
+    }
+
     const range = getScheduleRange();
 
     setIsBusy(true);
     setErrorMessage(null);
 
     try {
-      await refreshRange(range.from, range.to, { includeGrades: false, merge: false });
+      await refreshRange(range.from, range.to, {
+        allowNotifications: true,
+        force: true,
+        includeGrades: false,
+        includeInbox: true,
+        merge: false,
+      });
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : 'Rooster vernieuwen mislukte.');
       throw error;
     } finally {
       setIsBusy(false);
     }
-  }, [refreshRange]);
+  }, [preferences.demoModeEnabled, refreshRange]);
+
+  const refreshInbox = useCallback(async () => {
+    if (preferences.demoModeEnabled || !session?.accessToken) {
+      return;
+    }
+
+    setIsBusy(true);
+    setErrorMessage(null);
+
+    try {
+      const previousMessages = inboxPreviewRef.current;
+      const inboxResult = await loadInboxForSession(session);
+      await notifyAboutNewMessages(
+        previousMessages,
+        inboxResult.inboxPreview,
+        preferences.mailNotificationsEnabled,
+        preferences.priorityMailOnlyNotifications,
+      ).catch(() => {
+        return;
+      });
+      const refreshedSession = await persistRefreshedSession(inboxResult.refreshedSession);
+
+      await persistMagisterCache({
+        personId: refreshedSession.personId ?? refreshedSession.id,
+        cachedAt: new Date().toISOString(),
+        scheduleFrom: cacheMeta?.scheduleFrom,
+        scheduleTo: cacheMeta?.scheduleTo,
+        appointments: appointmentsRef.current,
+        grades: gradesRef.current,
+        inboxPreview: inboxResult.inboxPreview,
+        subjectAverages: subjectAveragesRef.current,
+      });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Inbox vernieuwen mislukte.');
+      throw error;
+    } finally {
+      setIsBusy(false);
+    }
+  }, [
+    cacheMeta?.scheduleFrom,
+    cacheMeta?.scheduleTo,
+    loadInboxForSession,
+    persistMagisterCache,
+    persistRefreshedSession,
+    preferences.demoModeEnabled,
+    preferences.mailNotificationsEnabled,
+    preferences.priorityMailOnlyNotifications,
+    session,
+  ]);
 
   const ensureScheduleRangeLoaded = useCallback(async (from: string, to: string) => {
+    if (preferences.demoModeEnabled) {
+      return;
+    }
+
     setIsBusy(true);
     setErrorMessage(null);
 
@@ -478,7 +867,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
     } finally {
       setIsBusy(false);
     }
-  }, [refreshRange]);
+  }, [preferences.demoModeEnabled, refreshRange]);
 
   const updatePreferences = useCallback(async (
     value: Partial<AppPreferences> | ((current: AppPreferences) => AppPreferences),
@@ -511,6 +900,7 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
   const logout = useCallback(async () => {
     setAppointments([]);
     setGrades([]);
+    setInboxPreview([]);
     setSubjectAverages([]);
     setSession(null);
     setCacheMeta(null);
@@ -523,26 +913,93 @@ export function WalburgAppProvider({ children }: PropsWithChildren) {
     setErrorMessage(null);
   }, []);
 
+  const markMessageReadLocally = useCallback((messageId: number) => {
+    setInboxPreview((current) =>
+      current.map((message) => (message.id === messageId ? { ...message, isRead: true } : message)),
+    );
+  }, []);
+
+  const setAppointmentCompletion = useCallback(async (appointmentId: string, completed: boolean) => {
+    if (preferences.demoModeEnabled || !session?.accessToken) {
+      return null;
+    }
+
+    const numericAppointmentId = Number(appointmentId);
+
+    if (!Number.isFinite(numericAppointmentId)) {
+      throw new Error('Deze afspraak kan niet worden bijgewerkt.');
+    }
+
+    const refreshedSession = await ensureFreshSession(session);
+    const personId = refreshedSession.personId ?? refreshedSession.id;
+    const updatedAppointment = await updateAppointmentCompletionFromTokens(
+      refreshedSession,
+      personId,
+      numericAppointmentId,
+      completed,
+    );
+
+    if (!updatedAppointment) {
+      return null;
+    }
+
+    const nextAppointments = appointmentsRef.current.map((appointment) =>
+      appointment.id === updatedAppointment.id ? { ...appointment, ...updatedAppointment } : appointment,
+    );
+
+    setAppointments(nextAppointments);
+
+    const nextSession = await persistRefreshedSession(refreshedSession);
+    await persistMagisterCache({
+      personId: nextSession.personId ?? nextSession.id,
+      cachedAt: new Date().toISOString(),
+      scheduleFrom: cacheMeta?.scheduleFrom,
+      scheduleTo: cacheMeta?.scheduleTo,
+      appointments: nextAppointments,
+      grades: gradesRef.current,
+      inboxPreview: inboxPreviewRef.current,
+      subjectAverages: subjectAveragesRef.current,
+    });
+
+    return updatedAppointment;
+  }, [
+    cacheMeta?.scheduleFrom,
+    cacheMeta?.scheduleTo,
+    ensureFreshSession,
+    persistMagisterCache,
+    persistRefreshedSession,
+    preferences.demoModeEnabled,
+    session,
+  ]);
+
+  const unreadInboxCount = countUnreadMessages(effectiveInboxPreview);
+
   return (
     <WalburgAppContext.Provider
       value={{
-        appointments,
-        grades,
-        subjectAverages,
+        appointments: effectiveAppointments,
+        grades: effectiveGrades,
+        inboxPreview: effectiveInboxPreview,
+        subjectAverages: effectiveSubjectAverages,
         preferences,
+        isDemoMode,
         isBusy,
         isHydrating,
-        session,
+        unreadInboxCount,
+        session: effectiveSession,
         errorMessage,
         clearError,
         loginWithMagister,
         connectWithManualTokens,
         logout,
         refreshAppData,
+        refreshInbox,
         refreshSchedule,
         ensureScheduleRangeLoaded,
         updatePreferences,
         toggleAgendaReminder,
+        markMessageReadLocally,
+        setAppointmentCompletion,
       }}
     >
       {children}

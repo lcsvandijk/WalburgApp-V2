@@ -1,16 +1,20 @@
 import { Ionicons } from '@expo/vector-icons';
+import { NativeStackScreenProps } from '@react-navigation/native-stack';
+import * as Crypto from 'expo-crypto';
 import * as Haptics from 'expo-haptics';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Modal,
   Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Switch,
   Text,
+  TextInput,
   View,
   useWindowDimensions,
 } from 'react-native';
@@ -20,8 +24,15 @@ import { appConfig } from '../constants/appConfig';
 import { theme } from '../constants/theme';
 import { useWalburgApp } from '../context/WalburgAppContext';
 import { formatDayLabel, formatTime } from '../lib/date';
+import { openExternalUrl } from '../lib/externalLinks';
+import { sendInstantAppNotification } from '../services/notifications';
+import { ProfileStackParamList } from '../types/navigation';
 
 type SettingsPane = 'overview' | 'notifications' | 'appAccess' | 'accountInfo';
+type DebugMessageType = 'activiteiten' | 'cijfer' | 'rooster';
+type Props = NativeStackScreenProps<ProfileStackParamList, 'ProfileIndex'>;
+
+const DEBUG_CODE_HASH = '2ee62f16ca41fe7879853975d5fcb4cb858f6edb5fd0355cfb7948d997e6b6a9';
 
 function formatSyncLabel(value?: string) {
   if (!value) {
@@ -44,23 +55,50 @@ async function safeHaptic(kind: 'selection' | 'success') {
   }
 }
 
-export function ProfileScreen() {
+export function ProfileScreen({ navigation }: Props) {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const {
     clearError,
     errorMessage,
+    isDemoMode,
     isBusy,
     loginWithMagister,
     logout,
     preferences,
     refreshAppData,
+    unreadInboxCount,
     session,
     updatePreferences,
   } = useWalburgApp();
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [activePane, setActivePane] = useState<SettingsPane>('overview');
+  const [versionTapCount, setVersionTapCount] = useState(0);
+  const [isDebugCodeVisible, setIsDebugCodeVisible] = useState(false);
+  const [isDebugMenuVisible, setIsDebugMenuVisible] = useState(false);
+  const [debugCode, setDebugCode] = useState('');
+  const [isCheckingDebugCode, setIsCheckingDebugCode] = useState(false);
+  const [debugApiOutageMode, setDebugApiOutageMode] = useState(false);
+  const [debugVerboseStatus, setDebugVerboseStatus] = useState(false);
+  const [debugForceDemoActivities, setDebugForceDemoActivities] = useState(false);
+  const [debugMessages, setDebugMessages] = useState<
+    Array<{ id: string; text: string; type: DebugMessageType }>
+  >([]);
   const isWideLayout = width >= appConfig.layout.landscapeWidth;
+
+  useEffect(() => {
+    if (versionTapCount === 0 || isDebugCodeVisible) {
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      setVersionTapCount(0);
+    }, 1800);
+
+    return () => {
+      clearTimeout(timeout);
+    };
+  }, [isDebugCodeVisible, versionTapCount]);
 
   const categoryCards = useMemo(
     () => [
@@ -110,6 +148,74 @@ export function ProfileScreen() {
     }
   }
 
+  async function handleVersionTap() {
+    const nextCount = versionTapCount + 1;
+    setVersionTapCount(nextCount);
+
+    if (nextCount < 5) {
+      await safeHaptic('selection');
+      return;
+    }
+
+    setVersionTapCount(0);
+    setDebugCode('');
+    setIsDebugCodeVisible(true);
+    await safeHaptic('success');
+  }
+
+  async function handleDebugCodeSubmit() {
+    setIsCheckingDebugCode(true);
+
+    try {
+      const digest = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, debugCode.trim());
+
+      if (digest !== DEBUG_CODE_HASH) {
+        Alert.alert('Code onjuist', 'Deze debugcode klopt niet.');
+        return;
+      }
+
+      setIsDebugCodeVisible(false);
+      setIsDebugMenuVisible(true);
+      setDebugCode('');
+      await safeHaptic('success');
+    } finally {
+      setIsCheckingDebugCode(false);
+    }
+  }
+
+  async function simulateDebugMessage(type: DebugMessageType) {
+    const label =
+      type === 'cijfer'
+        ? 'Nieuw cijfer ontvangen'
+        : type === 'rooster'
+          ? 'Roosterwijziging gesimuleerd'
+          : 'Activiteitenmelding toegevoegd';
+    const notificationBody =
+      type === 'cijfer'
+        ? 'Wiskunde | SO Hoofdstuk 4 | 8,1'
+        : type === 'rooster'
+          ? 'Engels | 10:20 | B203'
+          : 'Open dag voorbereiding | Vandaag 15:30';
+
+    setDebugMessages((current) => [
+      {
+        id: `${type}-${Date.now()}`,
+        text: `${label} | ${new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' })}`,
+        type,
+      },
+      ...current,
+    ]);
+
+    await sendInstantAppNotification({
+      title: label,
+      body: notificationBody,
+      subtitle: type === 'cijfer' ? 'Cijfers' : type === 'rooster' ? 'Rooster' : 'Activiteiten',
+      data: {
+        debugType: type,
+      },
+    });
+  }
+
   function renderOverview() {
     return (
       <>
@@ -118,7 +224,11 @@ export function ProfileScreen() {
             <Text style={styles.sessionLabel}>Sessie</Text>
             <Text style={styles.sessionTitle}>{session ? session.fullName : 'Nog niet ingelogd'}</Text>
             <Text style={styles.sessionMeta}>
-              {session ? `Laatste sync | ${formatSyncLabel(session.lastSyncedAt)}` : 'Log in om je rooster en cijfers te koppelen.'}
+              {isDemoMode
+                ? 'Demo-account actief voor screenshots en voorbeelddata.'
+                : session
+                  ? `Laatst bijgewerkt | ${formatSyncLabel(session.lastSyncedAt)}`
+                  : 'Log in om je rooster en cijfers te koppelen.'}
             </Text>
           </View>
           {!session ? (
@@ -126,6 +236,56 @@ export function ProfileScreen() {
               {isBusy ? <ActivityIndicator color={theme.colors.inkOnDark} /> : <Text style={styles.primaryButtonText}>Inloggen</Text>}
             </Pressable>
           ) : null}
+        </View>
+
+        <View style={styles.quickSection}>
+          <Pressable onPress={() => navigation.navigate('Inbox')} style={styles.quickLinkCard}>
+            <View style={styles.quickLinkIcon}>
+              <Ionicons color={theme.colors.brandBlue} name="mail-outline" size={20} />
+            </View>
+            <View style={styles.quickLinkCopy}>
+              <Text style={styles.quickLinkTitle}>Inbox</Text>
+              <Text style={styles.quickLinkText}>
+                Open je berichten, bekijk ongelezen mail en verstuur een nieuw bericht.
+              </Text>
+            </View>
+            {unreadInboxCount > 0 ? (
+              <View style={styles.quickLinkBadge}>
+                <Text style={styles.quickLinkBadgeText}>{unreadInboxCount > 9 ? '9+' : unreadInboxCount}</Text>
+              </View>
+            ) : null}
+            <Ionicons color={theme.colors.brandBlue} name="chevron-forward" size={18} />
+          </Pressable>
+        </View>
+
+        <View style={styles.quickSection}>
+          <Pressable onPress={() => navigation.navigate('AbsenceOverview')} style={styles.quickLinkCard}>
+            <View style={styles.quickLinkIcon}>
+              <Ionicons color={theme.colors.brandBlue} name="calendar-outline" size={20} />
+            </View>
+            <View style={styles.quickLinkCopy}>
+              <Text style={styles.quickLinkTitle}>Afwezigheid</Text>
+              <Text style={styles.quickLinkText}>
+                Bekijk meldingen en lesabsenties in twee aparte tabbladen.
+              </Text>
+            </View>
+            <Ionicons color={theme.colors.brandBlue} name="chevron-forward" size={18} />
+          </Pressable>
+        </View>
+
+        <View style={styles.quickSection}>
+          <Pressable onPress={() => navigation.navigate('LearningResources')} style={styles.quickLinkCard}>
+            <View style={styles.quickLinkIcon}>
+              <Ionicons color={theme.colors.brandBlue} name="book-outline" size={20} />
+            </View>
+            <View style={styles.quickLinkCopy}>
+              <Text style={styles.quickLinkTitle}>Leermiddelen</Text>
+              <Text style={styles.quickLinkText}>
+                Open je digitale leermiddelen direct in een externe browser.
+              </Text>
+            </View>
+            <Ionicons color={theme.colors.brandBlue} name="chevron-forward" size={18} />
+          </Pressable>
         </View>
 
         <View style={styles.settingsHeader}>
@@ -159,6 +319,36 @@ export function ProfileScreen() {
       <View style={styles.detailCard}>
         <View style={styles.settingRow}>
           <View style={styles.settingCopy}>
+            <Text style={styles.settingLabel}>Nieuwe mail</Text>
+            <Text style={styles.settingMeta}>Lokale melding wanneer er nieuwe ongelezen inbox-berichten binnenkomen.</Text>
+          </View>
+          <Switch
+            onValueChange={(value) => updatePreferences({ mailNotificationsEnabled: value })}
+            thumbColor={theme.colors.paper}
+            trackColor={{ false: '#B8C8E2', true: theme.colors.brandBlue }}
+            value={preferences.mailNotificationsEnabled}
+          />
+        </View>
+
+        {preferences.mailNotificationsEnabled ? (
+          <View style={[styles.settingRow, styles.settingRowBorder]}>
+            <View style={styles.settingCopy}>
+              <Text style={styles.settingLabel}>Alleen belangrijke mail</Text>
+              <Text style={styles.settingMeta}>
+                Geef alleen een melding bij nieuwe berichten die als belangrijk zijn gemarkeerd.
+              </Text>
+            </View>
+            <Switch
+              onValueChange={(value) => updatePreferences({ priorityMailOnlyNotifications: value })}
+              thumbColor={theme.colors.paper}
+              trackColor={{ false: '#B8C8E2', true: theme.colors.brandBlue }}
+              value={preferences.priorityMailOnlyNotifications}
+            />
+          </View>
+        ) : null}
+
+        <View style={[styles.settingRow, styles.settingRowBorder]}>
+          <View style={styles.settingCopy}>
             <Text style={styles.settingLabel}>Nieuwe cijfers</Text>
             <Text style={styles.settingMeta}>Meldingen zodra er nieuwe cijfers binnenkomen.</Text>
           </View>
@@ -183,6 +373,19 @@ export function ProfileScreen() {
           />
         </View>
 
+        <View style={[styles.settingRow, styles.settingRowBorder]}>
+          <View style={styles.settingCopy}>
+            <Text style={styles.settingLabel}>Lesherinnering 5 minuten van tevoren</Text>
+            <Text style={styles.settingMeta}>Krijg vlak voor je les een melding met vak en lokaal.</Text>
+          </View>
+          <Switch
+            onValueChange={(value) => updatePreferences({ lessonRemindersEnabled: value })}
+            thumbColor={theme.colors.paper}
+            trackColor={{ false: '#B8C8E2', true: theme.colors.brandBlue }}
+            value={preferences.lessonRemindersEnabled}
+          />
+        </View>
+
         <View style={[styles.detailRow, styles.settingRowBorder]}>
           <Text style={styles.detailLabel}>Activiteit-herinneringen</Text>
           <Text style={styles.detailValue}>{preferences.savedReminderEventIds.length}</Text>
@@ -190,7 +393,7 @@ export function ProfileScreen() {
 
         <View style={[styles.infoNote, styles.settingRowBorder]}>
           <Text style={styles.infoNoteText}>
-            Herinneringen voor schoolactiviteiten zet je direct aan vanuit een activiteit zelf.
+            Nieuwe cijfers en roosterwijzigingen kunnen een lokale melding geven zodra de app synchroniseert. Lesherinneringen worden 5 minuten van tevoren ingepland op je toestel.
           </Text>
         </View>
       </View>
@@ -218,6 +421,7 @@ export function ProfileScreen() {
           <Text style={styles.detailLabel}>Schoolactiviteiten met belletje</Text>
           <Text style={styles.detailValue}>{preferences.savedReminderEventIds.length}</Text>
         </View>
+        
 
         {!session ? (
           <Pressable disabled={isBusy} onPress={handleOAuthLogin} style={styles.primaryButtonFull}>
@@ -261,25 +465,42 @@ export function ProfileScreen() {
           <Text style={styles.detailValue}>{session?.fullName ?? '-'}</Text>
         </View>
         <View style={[styles.detailRow, styles.settingRowBorder]}>
-          <Text style={styles.detailLabel}>Laatste sync</Text>
+          <Text style={styles.detailLabel}>Laatst bijgewerkt</Text>
           <Text style={styles.detailValue}>{formatSyncLabel(session?.lastSyncedAt)}</Text>
         </View>
-        <View style={[styles.detailRow, styles.settingRowBorder]}>
+        <Pressable onPress={handleVersionTap} style={[styles.detailRow, styles.settingRowBorder]}>
           <Text style={styles.detailLabel}>Appversie</Text>
           <Text style={styles.detailValue}>v{appConfig.app.version}</Text>
-        </View>
+        </Pressable>
         <View style={[styles.detailRow, styles.settingRowBorder]}>
           <Text style={styles.detailLabel}>School</Text>
           <Text style={styles.detailValue}>{appConfig.school.name}</Text>
         </View>
         <View style={[styles.detailRow, styles.settingRowBorder]}>
           <Text style={styles.detailLabel}>Website</Text>
-          <Text numberOfLines={1} style={styles.detailValue}>
-            {appConfig.school.website.replace('https://', '')}
-          </Text>
+          <Pressable onPress={() => openExternalUrl(appConfig.school.website)} style={styles.inlineLinkWrap}>
+            <Text numberOfLines={1} style={styles.detailLinkValue}>
+              {appConfig.school.website.replace('https://', '')}
+            </Text>
+          </Pressable>
+        </View>
+        <View style={[styles.detailRow, styles.settingRowBorder]}>
+          <Text style={styles.detailLabel}>Feedback</Text>
+          <Pressable
+            onPress={() => openExternalUrl('https://forms.gle/bb49ERNxZ4sNEXkX8', 'Het feedbackformulier kon niet worden geopend.')}
+            style={styles.inlineLinkWrap}
+          >
+            <Text numberOfLines={1} style={styles.detailLinkValue}>
+              Open feedbackformulier
+            </Text>
+          </Pressable>
         </View>
 
-        {session ? (
+        {isDemoMode ? (
+          <Pressable onPress={() => updatePreferences({ demoModeEnabled: false })} style={styles.logoutButton}>
+            <Text style={styles.logoutButtonText}>Demo mode verlaten</Text>
+          </Pressable>
+        ) : session ? (
           <Pressable disabled={isBusy} onPress={logout} style={styles.logoutButton}>
             <Text style={styles.logoutButtonText}>Uitloggen</Text>
           </Pressable>
@@ -347,6 +568,179 @@ export function ProfileScreen() {
           {renderActivePane()}
         </View>
       </ScrollView>
+
+      <Modal
+        animationType="fade"
+        onRequestClose={() => setIsDebugCodeVisible(false)}
+        presentationStyle="overFullScreen"
+        statusBarTranslucent
+        transparent
+        visible={isDebugCodeVisible}
+      >
+        <View style={styles.modalScrim}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Debugcode</Text>
+            <Text style={styles.modalText}>Voer de verborgen code in om het debugmenu te openen.</Text>
+            <View style={styles.debugInputWrap}>
+              <TextInput
+                autoFocus
+                keyboardType="number-pad"
+                onChangeText={setDebugCode}
+                placeholder="Code"
+                placeholderTextColor={theme.colors.textMuted}
+                secureTextEntry
+                style={styles.debugInput}
+                value={debugCode}
+              />
+            </View>
+            <View style={styles.debugButtonRow}>
+              <Pressable onPress={() => setIsDebugCodeVisible(false)} style={styles.secondaryButton}>
+                <Text style={styles.secondaryButtonText}>Sluiten</Text>
+              </Pressable>
+              <Pressable
+                disabled={isCheckingDebugCode || debugCode.trim().length === 0}
+                onPress={handleDebugCodeSubmit}
+                style={[styles.primaryButtonInline, isCheckingDebugCode ? styles.buttonDisabled : null]}
+              >
+                {isCheckingDebugCode ? (
+                  <ActivityIndicator color={theme.colors.inkOnDark} size="small" />
+                ) : (
+                  <Text style={styles.primaryButtonText}>Openen</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        animationType="slide"
+        onRequestClose={() => setIsDebugMenuVisible(false)}
+        presentationStyle="overFullScreen"
+        statusBarTranslucent
+        transparent
+        visible={isDebugMenuVisible}
+      >
+        <View style={styles.modalScrim}>
+          <View style={styles.debugMenuCard}>
+            <View style={styles.debugMenuHeader}>
+              <View style={styles.debugMenuCopy}>
+                <Text style={styles.modalTitle}>Debugmenu</Text>
+                <Text style={styles.modalText}>Verborgen testpaneel voor demo- en simulatietools.</Text>
+              </View>
+              <Pressable onPress={() => setIsDebugMenuVisible(false)} style={styles.closeButton}>
+                <Ionicons color={theme.colors.brandBlueDeep} name="close" size={18} />
+              </Pressable>
+            </View>
+
+            <ScrollView showsVerticalScrollIndicator={false}>
+              <View style={styles.debugSection}>
+                <Text style={styles.debugSectionTitle}>Statussen</Text>
+                <View style={styles.settingRow}>
+                  <View style={styles.settingCopy}>
+                    <Text style={styles.settingLabel}>Demo mode</Text>
+                    <Text style={styles.settingMeta}>Snelle stand voor screenshots en testscenario's.</Text>
+                  </View>
+                  <Switch
+                    onValueChange={(value) => updatePreferences({ demoModeEnabled: value })}
+                    thumbColor={theme.colors.paper}
+                    trackColor={{ false: '#B8C8E2', true: theme.colors.brandBlue }}
+                    value={preferences.demoModeEnabled}
+                  />
+                </View>
+                <View style={[styles.settingRow, styles.settingRowBorder]}>
+                  <View style={styles.settingCopy}>
+                    <Text style={styles.settingLabel}>API storing simuleren</Text>
+                    <Text style={styles.settingMeta}>Gebruik om errorstates en fallback-UI te bekijken.</Text>
+                  </View>
+                  <Switch
+                    onValueChange={setDebugApiOutageMode}
+                    thumbColor={theme.colors.paper}
+                    trackColor={{ false: '#B8C8E2', true: theme.colors.brandBlue }}
+                    value={debugApiOutageMode}
+                  />
+                </View>
+                <View style={[styles.settingRow, styles.settingRowBorder]}>
+                  <View style={styles.settingCopy}>
+                    <Text style={styles.settingLabel}>Verbose statuslabels</Text>
+                    <Text style={styles.settingMeta}>Handig om edge cases en interne staten te spotten.</Text>
+                  </View>
+                  <Switch
+                    onValueChange={setDebugVerboseStatus}
+                    thumbColor={theme.colors.paper}
+                    trackColor={{ false: '#B8C8E2', true: theme.colors.brandBlue }}
+                    value={debugVerboseStatus}
+                  />
+                </View>
+                <View style={[styles.settingRow, styles.settingRowBorder]}>
+                  <View style={styles.settingCopy}>
+                    <Text style={styles.settingLabel}>Demo-activiteiten forceren</Text>
+                    <Text style={styles.settingMeta}>Voor later gebruik als je altijd een gevulde demo wilt.</Text>
+                  </View>
+                  <Switch
+                    onValueChange={setDebugForceDemoActivities}
+                    thumbColor={theme.colors.paper}
+                    trackColor={{ false: '#B8C8E2', true: theme.colors.brandBlue }}
+                    value={debugForceDemoActivities}
+                  />
+                </View>
+                <Pressable
+                  onPress={() => {
+                    updatePreferences({ onboardingCompleted: false }).catch(() => {
+                      return;
+                    });
+                    Alert.alert('Onboarding gereset', 'Bij de volgende start krijg je de onboarding opnieuw te zien.');
+                  }}
+                  style={[styles.debugResetButton, styles.settingRowBorder]}
+                >
+                  <Ionicons color={theme.colors.brandBlue} name="refresh-outline" size={18} />
+                  <View style={styles.debugResetCopy}>
+                    <Text style={styles.debugResetTitle}>Onboarding resetten</Text>
+                    <Text style={styles.debugResetText}>Toon de eerste-opstartflow opnieuw bij de volgende appstart.</Text>
+                  </View>
+                </Pressable>
+              </View>
+
+              <View style={styles.debugSection}>
+                <Text style={styles.debugSectionTitle}>Message Simulation</Text>
+                <View style={styles.debugActionGrid}>
+                  <Pressable onPress={() => simulateDebugMessage('cijfer')} style={styles.debugActionButton}>
+                    <Ionicons color={theme.colors.brandBlue} name="stats-chart-outline" size={18} />
+                    <Text style={styles.debugActionText}>Cijfer</Text>
+                  </Pressable>
+                  <Pressable onPress={() => simulateDebugMessage('rooster')} style={styles.debugActionButton}>
+                    <Ionicons color={theme.colors.brandBlue} name="swap-horizontal-outline" size={18} />
+                    <Text style={styles.debugActionText}>Rooster</Text>
+                  </Pressable>
+                  <Pressable onPress={() => simulateDebugMessage('activiteiten')} style={styles.debugActionButton}>
+                    <Ionicons color={theme.colors.brandBlue} name="pencil-outline" size={18} />
+                    <Text style={styles.debugActionText}>Activiteit</Text>
+                  </Pressable>
+                </View>
+              </View>
+
+              <View style={styles.debugSection}>
+                <View style={styles.debugSectionHeader}>
+                  <Text style={styles.debugSectionTitle}>Simulaties</Text>
+                  <Pressable onPress={() => setDebugMessages([])} style={styles.debugClearButton}>
+                    <Text style={styles.debugClearText}>Leegmaken</Text>
+                  </Pressable>
+                </View>
+                {debugMessages.length === 0 ? (
+                  <Text style={styles.debugEmptyText}>Nog geen gesimuleerde berichten toegevoegd.</Text>
+                ) : (
+                  debugMessages.map((message) => (
+                    <View key={message.id} style={styles.debugMessageCard}>
+                      <Text style={styles.debugMessageType}>{message.type}</Text>
+                      <Text style={styles.debugMessageText}>{message.text}</Text>
+                    </View>
+                  ))
+                )}
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -395,6 +789,57 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
     paddingVertical: 18,
   },
+  quickSection: {
+    marginTop: 18,
+  },
+  quickLinkCard: {
+    alignItems: 'center',
+    backgroundColor: theme.colors.paper,
+    borderColor: theme.colors.divider,
+    borderRadius: 18,
+    borderWidth: 1,
+    flexDirection: 'row',
+    gap: 14,
+    paddingHorizontal: 18,
+    paddingVertical: 16,
+  },
+  quickLinkIcon: {
+    alignItems: 'center',
+    backgroundColor: '#EDF4FF',
+    borderRadius: 12,
+    height: 42,
+    justifyContent: 'center',
+    width: 42,
+  },
+  quickLinkCopy: {
+    flex: 1,
+  },
+  quickLinkTitle: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.heavy,
+    fontSize: 17,
+  },
+  quickLinkText: {
+    color: theme.colors.textSoft,
+    fontFamily: theme.fonts.medium,
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 6,
+  },
+  quickLinkBadge: {
+    alignItems: 'center',
+    backgroundColor: theme.colors.brandCyan,
+    borderRadius: theme.radius.pill,
+    justifyContent: 'center',
+    minWidth: 28,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+  },
+  quickLinkBadgeText: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.heavy,
+    fontSize: 12,
+  },
   sessionCopy: {
     flex: 1,
   },
@@ -432,6 +877,7 @@ const styles = StyleSheet.create({
     backgroundColor: theme.colors.brandBlue,
     borderRadius: 14,
     justifyContent: 'center',
+    marginHorizontal: 16,
     marginTop: 16,
     minHeight: 52,
   },
@@ -500,7 +946,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     flexDirection: 'row',
     gap: 12,
-    marginTop: 18,
+    marginTop: 20,
   },
   backButton: {
     alignItems: 'center',
@@ -532,7 +978,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     marginTop: 16,
     overflow: 'hidden',
-    paddingBottom: 2,
   },
   settingRow: {
     alignItems: 'center',
@@ -577,6 +1022,7 @@ const styles = StyleSheet.create({
     lineHeight: 19,
   },
   settingsBlockHeader: {
+    paddingBottom: 12,
     paddingHorizontal: 16,
     paddingTop: 16,
   },
@@ -605,6 +1051,17 @@ const styles = StyleSheet.create({
     maxWidth: '62%',
     textAlign: 'right',
   },
+  inlineLinkWrap: {
+    alignItems: 'flex-end',
+    flexShrink: 1,
+    maxWidth: '62%',
+  },
+  detailLinkValue: {
+    color: theme.colors.brandBlue,
+    fontFamily: theme.fonts.bold,
+    fontSize: 14,
+    textAlign: 'right',
+  },
   logoutButton: {
     alignItems: 'center',
     backgroundColor: '#EEF4FF',
@@ -618,5 +1075,202 @@ const styles = StyleSheet.create({
     color: theme.colors.brandBlueDeep,
     fontFamily: theme.fonts.heavy,
     fontSize: 15,
+  },
+  modalScrim: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(14, 27, 51, 0.42)',
+    flex: 1,
+    justifyContent: 'center',
+    paddingHorizontal: 18,
+  },
+  modalCard: {
+    backgroundColor: theme.colors.paper,
+    borderRadius: 24,
+    maxWidth: 460,
+    padding: 20,
+    width: '100%',
+  },
+  debugMenuCard: {
+    backgroundColor: theme.colors.paper,
+    borderRadius: 24,
+    maxHeight: '88%',
+    maxWidth: 760,
+    padding: 20,
+    width: '100%',
+  },
+  debugMenuHeader: {
+    alignItems: 'flex-start',
+    flexDirection: 'row',
+    gap: 12,
+    justifyContent: 'space-between',
+  },
+  debugMenuCopy: {
+    flex: 1,
+    minWidth: 0,
+  },
+  closeButton: {
+    alignItems: 'center',
+    backgroundColor: '#EDF4FF',
+    borderRadius: 12,
+    height: 38,
+    justifyContent: 'center',
+    width: 38,
+  },
+  modalTitle: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.heavy,
+    fontSize: 24,
+    lineHeight: 30,
+  },
+  modalText: {
+    color: theme.colors.textSoft,
+    fontFamily: theme.fonts.medium,
+    fontSize: 14,
+    lineHeight: 20,
+    marginTop: 8,
+  },
+  debugInputWrap: {
+    backgroundColor: '#F6FAFF',
+    borderColor: theme.colors.divider,
+    borderRadius: 14,
+    borderWidth: 1,
+    marginTop: 16,
+    minHeight: 54,
+    paddingHorizontal: 14,
+  },
+  debugInput: {
+    color: theme.colors.text,
+    fontFamily: theme.fonts.medium,
+    fontSize: 16,
+    minHeight: 54,
+  },
+  debugButtonRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 16,
+  },
+  secondaryButton: {
+    alignItems: 'center',
+    backgroundColor: '#EEF4FF',
+    borderRadius: 14,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 50,
+  },
+  secondaryButtonText: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.heavy,
+    fontSize: 15,
+  },
+  primaryButtonInline: {
+    alignItems: 'center',
+    backgroundColor: theme.colors.brandBlue,
+    borderRadius: 14,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 50,
+  },
+  buttonDisabled: {
+    opacity: 0.6,
+  },
+  debugSection: {
+    backgroundColor: '#F9FBFE',
+    borderColor: theme.colors.divider,
+    borderRadius: 18,
+    borderWidth: 1,
+    marginTop: 16,
+    overflow: 'hidden',
+  },
+  debugSectionHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingTop: 16,
+  },
+  debugSectionTitle: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.heavy,
+    fontSize: 18,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+  },
+  debugActionGrid: {
+    flexDirection: 'row',
+    gap: 10,
+    padding: 16,
+  },
+  debugActionButton: {
+    alignItems: 'center',
+    backgroundColor: theme.colors.paper,
+    borderColor: theme.colors.divider,
+    borderRadius: 14,
+    borderWidth: 1,
+    flex: 1,
+    gap: 8,
+    justifyContent: 'center',
+    minHeight: 94,
+  },
+  debugActionText: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.bold,
+    fontSize: 13,
+  },
+  debugResetButton: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+  },
+  debugResetCopy: {
+    flex: 1,
+  },
+  debugResetTitle: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.bold,
+    fontSize: 15,
+  },
+  debugResetText: {
+    color: theme.colors.textSoft,
+    fontFamily: theme.fonts.medium,
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 6,
+  },
+  debugClearButton: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  debugClearText: {
+    color: theme.colors.brandBlue,
+    fontFamily: theme.fonts.bold,
+    fontSize: 13,
+  },
+  debugEmptyText: {
+    color: theme.colors.textSoft,
+    fontFamily: theme.fonts.medium,
+    fontSize: 14,
+    lineHeight: 20,
+    padding: 16,
+  },
+  debugMessageCard: {
+    borderTopColor: theme.colors.divider,
+    borderTopWidth: 1,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  debugMessageType: {
+    color: theme.colors.brandBlue,
+    fontFamily: theme.fonts.bold,
+    fontSize: 11,
+    textTransform: 'uppercase',
+  },
+  debugMessageText: {
+    color: theme.colors.brandBlueDeep,
+    fontFamily: theme.fonts.medium,
+    fontSize: 14,
+    lineHeight: 20,
+    marginTop: 6,
   },
 });

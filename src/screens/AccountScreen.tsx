@@ -71,7 +71,7 @@ export function AccountScreen() {
                 <Text style={styles.detailValue}>{session.fullName}</Text>
               </View>
               <View style={[styles.detailRow, styles.detailRowBorder]}>
-                <Text style={styles.detailLabel}>Laatste sync</Text>
+                <Text style={styles.detailLabel}>Laatst bijgewerkt</Text>
                 <Text style={styles.detailValue}>{formatSyncLabel(session.lastSyncedAt)}</Text>
               </View>
             </>

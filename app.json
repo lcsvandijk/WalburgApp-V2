@@ -16,9 +16,11 @@
       "backgroundColor": "#0D8E68"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "nl.walburgcollege.app"
     },
     "android": {
+      "package": "nl.walburgcollege.app",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -32,8 +34,47 @@
     },
     "plugins": [
       "expo-secure-store",
+      "expo-notifications",
       "expo-web-browser",
-      "expo-font"
+      "expo-font",
+      [
+        "expo-widgets",
+        {
+          "groupIdentifier": "group.nl.walburgcollege.app",
+          "widgets": [
+            {
+              "name": "WalburgNextLessonWidget",
+              "displayName": "Volgende les",
+              "description": "Toon je eerstvolgende les op het beginscherm.",
+              "supportedFamilies": ["systemSmall"]
+            },
+            {
+              "name": "WalburgTodayAgendaWidget",
+              "displayName": "Schoolagenda vandaag",
+              "description": "Laat het eerstvolgende item uit de schoolagenda van vandaag zien.",
+              "supportedFamilies": ["systemSmall"]
+            },
+            {
+              "name": "WalburgLatestGradeWidget",
+              "displayName": "Laatste cijfer",
+              "description": "Laat je meest recente cijfer direct op het beginscherm zien.",
+              "supportedFamilies": ["systemSmall"]
+            },
+            {
+              "name": "WalburgNextLessonAgendaWidget",
+              "displayName": "Les + agenda",
+              "description": "Combineert je eerstvolgende les met het belangrijkste agenda-item van vandaag.",
+              "supportedFamilies": ["systemMedium"]
+            },
+            {
+              "name": "WalburgNextLessonGradeWidget",
+              "displayName": "Les + cijfer",
+              "description": "Combineert je eerstvolgende les met je meest recente cijfer.",
+              "supportedFamilies": ["systemMedium"]
+            }
+          ]
+        }
+      ]
     ]
   }
 }
