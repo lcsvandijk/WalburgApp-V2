@@ -6,18 +6,13 @@ import {
   Montserrat_800ExtraBold,
   useFonts,
 } from '@expo-google-fonts/montserrat';
-import {
-  NavigationContainer,
-  Theme as NavigationTheme,
-  createNavigationContainerRef,
-} from '@react-navigation/native';
+import { NavigationContainer, Theme as NavigationTheme } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import * as Notifications from 'expo-notifications';
 import { StatusBar } from 'expo-status-bar';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
-  Animated,
+  ActivityIndicator,
   Image,
   Modal,
   Pressable,
@@ -31,14 +26,8 @@ import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-cont
 import { appConfig } from './src/constants/appConfig';
 import { theme } from './src/constants/theme';
 import { useWalburgApp, WalburgAppProvider } from './src/context/WalburgAppContext';
-import { AbsenceScreen } from './src/screens/AbsenceScreen';
-import { ComposeMessageScreen } from './src/screens/ComposeMessageScreen';
-import { FloorPlanScreen } from './src/screens/FloorPlanScreen';
 import { GradesScreen } from './src/screens/GradesScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
-import { InboxMessageScreen } from './src/screens/InboxMessageScreen';
-import { InboxScreen } from './src/screens/InboxScreen';
-import { LearningResourcesScreen } from './src/screens/LearningResourcesScreen';
 import { NewsArticleScreen } from './src/screens/NewsArticleScreen';
 import { ActivityDetailsScreen } from './src/screens/ActivityDetailsScreen';
 import { ProfileScreen } from './src/screens/ProfileScreen';
@@ -46,19 +35,12 @@ import { SchoolPageScreen } from './src/screens/SchoolPageScreen';
 import { SchoolStaffDirectoryScreen } from './src/screens/SchoolStaffDirectoryScreen';
 import { SchoolStaffMemberScreen } from './src/screens/SchoolStaffMemberScreen';
 import { ScheduleScreen } from './src/screens/ScheduleScreen';
-import {
-  HomeStackParamList,
-  ProfileStackParamList,
-  RootTabParamList,
-  ScheduleStackParamList,
-} from './src/types/navigation';
+import { HomeStackParamList, ScheduleStackParamList } from './src/types/navigation';
 
-const Tab = createBottomTabNavigator<RootTabParamList>();
+const Tab = createBottomTabNavigator();
 const HomeStack = createNativeStackNavigator<HomeStackParamList>();
-const ProfileStack = createNativeStackNavigator<ProfileStackParamList>();
 const ScheduleStack = createNativeStackNavigator<ScheduleStackParamList>();
 const loadingImage = require('./assets/loading.png');
-const navigationRef = createNavigationContainerRef<RootTabParamList>();
 
 const navigationTheme: NavigationTheme = {
   dark: false,
@@ -90,7 +72,6 @@ function HomeStackNavigator() {
       }}
     >
       <HomeStack.Screen component={HomeScreen} name="HomeIndex" />
-      <HomeStack.Screen component={FloorPlanScreen} name="FloorPlan" />
       <HomeStack.Screen component={NewsArticleScreen} name="NewsArticle" />
       <HomeStack.Screen component={SchoolPageScreen} name="SchoolPage" />
       <HomeStack.Screen component={SchoolStaffDirectoryScreen} name="SchoolStaffDirectory" />
@@ -116,92 +97,14 @@ function ScheduleStackNavigator() {
   );
 }
 
-function ProfileStackNavigator() {
-  return (
-    <ProfileStack.Navigator
-      screenOptions={{
-        animation: 'slide_from_right',
-        contentStyle: {
-          backgroundColor: theme.colors.background,
-        },
-        headerShown: false,
-      }}
-    >
-      <ProfileStack.Screen component={ProfileScreen} name="ProfileIndex" />
-      <ProfileStack.Screen component={InboxScreen} name="Inbox" />
-      <ProfileStack.Screen component={InboxMessageScreen} name="InboxMessage" />
-      <ProfileStack.Screen component={ComposeMessageScreen} name="ComposeMessage" />
-      <ProfileStack.Screen component={AbsenceScreen} name="AbsenceOverview" />
-      <ProfileStack.Screen component={LearningResourcesScreen} name="LearningResources" />
-    </ProfileStack.Navigator>
-  );
-}
-
-function getStringValue(value: unknown) {
-  if (typeof value === 'string' && value.trim()) {
-    return value.trim();
-  }
-
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return String(value);
-  }
-
-  return undefined;
-}
-
-function navigateFromNotificationData(data?: Record<string, unknown>) {
-  if (!data || !navigationRef.isReady()) {
-    return false;
-  }
-
-  const messageId = Number(getStringValue(data.messageId));
-
-  if (Number.isFinite(messageId) && messageId > 0) {
-    navigationRef.navigate('Profiel', {
-      screen: 'InboxMessage',
-      params: {
-        messageId,
-      },
-    });
-    return true;
-  }
-
-  const appointmentId = getStringValue(data.appointmentId);
-
-  if (appointmentId) {
-    navigationRef.navigate('Rooster', {
-      screen: 'ScheduleIndex',
-      params: {
-        focusAppointmentId: appointmentId,
-        focusDate: getStringValue(data.appointmentStart),
-        focusNonce: String(Date.now()),
-      },
-    });
-    return true;
-  }
-
-  const gradeId = getStringValue(data.gradeId);
-
-  if (gradeId) {
-    navigationRef.navigate('Cijfers', {
-      focusGradeId: gradeId,
-      focusNonce: String(Date.now()),
-    });
-    return true;
-  }
-
-  return false;
-}
-
-function RootNavigator({ onReady }: { onReady?: () => void }) {
+function RootNavigator() {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
-  const { unreadInboxCount } = useWalburgApp();
   const isWideLayout = width >= appConfig.layout.landscapeWidth;
   const horizontalInset = isWideLayout ? Math.max(28, width * 0.12) : 0;
 
   return (
-    <NavigationContainer onReady={onReady} ref={navigationRef} theme={navigationTheme}>
+    <NavigationContainer theme={navigationTheme}>
       <StatusBar style="light" />
       <Tab.Navigator
         screenOptions={({ route }) => ({
@@ -235,12 +138,6 @@ function RootNavigator({ onReady }: { onReady?: () => void }) {
             fontFamily: theme.fonts.bold,
             fontSize: 12,
           },
-          tabBarBadgeStyle: {
-            backgroundColor: theme.colors.brandCyan,
-            color: theme.colors.brandBlueDeep,
-            fontFamily: theme.fonts.heavy,
-            fontSize: 11,
-          },
           tabBarIcon: ({ color, size, focused }) => {
             const iconName =
               route.name === 'Home'
@@ -269,25 +166,20 @@ function RootNavigator({ onReady }: { onReady?: () => void }) {
         <Tab.Screen component={HomeStackNavigator} name="Home" options={{ title: 'Home' }} />
         <Tab.Screen component={ScheduleStackNavigator} name="Rooster" options={{ title: 'Rooster' }} />
         <Tab.Screen component={GradesScreen} name="Cijfers" options={{ title: 'Cijfers' }} />
-        <Tab.Screen
-          component={ProfileStackNavigator}
-          name="Profiel"
-          options={{
-            title: 'Profiel',
-            tabBarBadge: unreadInboxCount > 0 ? (unreadInboxCount > 9 ? '9+' : unreadInboxCount) : undefined,
-          }}
-        />
+        <Tab.Screen component={ProfileScreen} name="Profiel" options={{ title: 'Profiel' }} />
       </Tab.Navigator>
     </NavigationContainer>
   );
 }
 
-function StartupOverlay({ opacity = 1 }: { opacity?: Animated.Value | number }) {
+function StartupOverlay() {
   return (
-    <Animated.View style={[styles.startupOverlay, { opacity }]}>
+    <View style={styles.startupOverlay}>
       <Image resizeMode="cover" source={loadingImage} style={styles.startupImage} />
-      <View style={styles.startupShade} />
-    </Animated.View>
+      <View style={styles.startupShade}>
+        <ActivityIndicator color={theme.colors.inkOnDark} size="large" />
+      </View>
+    </View>
   );
 }
 
@@ -307,8 +199,8 @@ function OnboardingModal({
         text: 'Open je rooster, tik op een les en gebruik de plattegrond om meteen te zien waar je moet zijn.',
       },
       {
-        title: 'Meldingen en demo',
-        text: 'Zet lesmeldingen aan voor 5 minuten van tevoren en gebruik demo mode als je nette screenshots wilt maken.',
+        title: 'Meldingen',
+        text: 'Zet lesmeldingen aan om 5 minuten voor je les een melding te krijgen, of krijg meldingen bij roosterwijzigingen & nieuwe cijfers.',
       },
     ],
     [],
@@ -369,57 +261,6 @@ function AppShell() {
   const [showStartupOverlay, setShowStartupOverlay] = useState(true);
   const [hasEvaluatedOnboarding, setHasEvaluatedOnboarding] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
-  const [navigationReady, setNavigationReady] = useState(false);
-  const startupOpacity = useRef(new Animated.Value(1)).current;
-  const startupFadeStartedRef = useRef(false);
-  const handledNotificationIdsRef = useRef<Set<string>>(new Set());
-  const pendingNotificationDataRef = useRef<Record<string, unknown> | null>(null);
-
-  useEffect(() => {
-    function handleNotificationResponse(response: Notifications.NotificationResponse | null) {
-      if (!response) {
-        return;
-      }
-
-      const identifier = response.notification.request.identifier;
-
-      if (handledNotificationIdsRef.current.has(identifier)) {
-        return;
-      }
-
-      handledNotificationIdsRef.current.add(identifier);
-
-      const nextData = response.notification.request.content.data as Record<string, unknown> | undefined;
-
-      if (!navigateFromNotificationData(nextData)) {
-        pendingNotificationDataRef.current = nextData ?? null;
-      }
-    }
-
-    Notifications.getLastNotificationResponseAsync()
-      .then((response) => {
-        handleNotificationResponse(response);
-      })
-      .catch(() => {
-        return;
-      });
-
-    const subscription = Notifications.addNotificationResponseReceivedListener(handleNotificationResponse);
-
-    return () => {
-      subscription.remove();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!navigationReady || !pendingNotificationDataRef.current) {
-      return;
-    }
-
-    if (navigateFromNotificationData(pendingNotificationDataRef.current)) {
-      pendingNotificationDataRef.current = null;
-    }
-  }, [navigationReady]);
 
   useEffect(() => {
     const timeout = setTimeout(() => {
@@ -440,19 +281,8 @@ function AppShell() {
       return;
     }
 
-    if (startupFadeStartedRef.current) {
-      return;
-    }
-
-    startupFadeStartedRef.current = true;
-    Animated.timing(startupOpacity, {
-      duration: 300,
-      toValue: 0,
-      useNativeDriver: true,
-    }).start(() => {
-      setShowStartupOverlay(false);
-    });
-  }, [isBusy, isHydrating, minimumStartupElapsed, showStartupOverlay, startupOpacity]);
+    setShowStartupOverlay(false);
+  }, [isBusy, isHydrating, minimumStartupElapsed, showStartupOverlay]);
 
   useEffect(() => {
     if (showStartupOverlay || hasEvaluatedOnboarding) {
@@ -465,8 +295,8 @@ function AppShell() {
 
   return (
     <View style={styles.appShell}>
-      <RootNavigator onReady={() => setNavigationReady(true)} />
-      {showStartupOverlay ? <StartupOverlay opacity={startupOpacity} /> : null}
+      <RootNavigator />
+      {showStartupOverlay ? <StartupOverlay /> : null}
       {showOnboarding ? (
         <OnboardingModal
           onComplete={() => {
@@ -518,7 +348,9 @@ const styles = StyleSheet.create({
   },
   startupShade: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(15, 35, 68, 0.08)',
+    alignItems: 'center',
+    backgroundColor: 'rgba(15, 35, 68, 0.16)',
+    justifyContent: 'center',
   },
   onboardingScrim: {
     alignItems: 'center',
