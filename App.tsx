@@ -30,16 +30,22 @@ import { GradesScreen } from './src/screens/GradesScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { NewsArticleScreen } from './src/screens/NewsArticleScreen';
 import { ActivityDetailsScreen } from './src/screens/ActivityDetailsScreen';
+import { AbsenceScreen } from './src/screens/AbsenceScreen';
+import { ComposeMessageScreen } from './src/screens/ComposeMessageScreen';
+import { InboxMessageScreen } from './src/screens/InboxMessageScreen';
+import { InboxScreen } from './src/screens/InboxScreen';
+import { LearningResourcesScreen } from './src/screens/LearningResourcesScreen';
 import { ProfileScreen } from './src/screens/ProfileScreen';
 import { SchoolPageScreen } from './src/screens/SchoolPageScreen';
 import { SchoolStaffDirectoryScreen } from './src/screens/SchoolStaffDirectoryScreen';
 import { SchoolStaffMemberScreen } from './src/screens/SchoolStaffMemberScreen';
 import { ScheduleScreen } from './src/screens/ScheduleScreen';
-import { HomeStackParamList, ScheduleStackParamList } from './src/types/navigation';
+import { HomeStackParamList, ProfileStackParamList, ScheduleStackParamList } from './src/types/navigation';
 
 const Tab = createBottomTabNavigator();
 const HomeStack = createNativeStackNavigator<HomeStackParamList>();
 const ScheduleStack = createNativeStackNavigator<ScheduleStackParamList>();
+const ProfileStack = createNativeStackNavigator<ProfileStackParamList>();
 const loadingImage = require('./assets/loading.png');
 
 const navigationTheme: NavigationTheme = {
@@ -94,6 +100,27 @@ function ScheduleStackNavigator() {
       <ScheduleStack.Screen component={ScheduleScreen} name="ScheduleIndex" />
       <ScheduleStack.Screen component={ActivityDetailsScreen} name="ActivityDetails" />
     </ScheduleStack.Navigator>
+  );
+}
+
+function ProfileStackNavigator() {
+  return (
+    <ProfileStack.Navigator
+      screenOptions={{
+        animation: 'slide_from_right',
+        contentStyle: {
+          backgroundColor: theme.colors.background,
+        },
+        headerShown: false,
+      }}
+    >
+      <ProfileStack.Screen component={ProfileScreen} name="ProfileIndex" />
+      <ProfileStack.Screen component={InboxScreen} name="Inbox" />
+      <ProfileStack.Screen component={InboxMessageScreen} name="InboxMessage" />
+      <ProfileStack.Screen component={ComposeMessageScreen} name="ComposeMessage" />
+      <ProfileStack.Screen component={AbsenceScreen} name="AbsenceOverview" />
+      <ProfileStack.Screen component={LearningResourcesScreen} name="LearningResources" />
+    </ProfileStack.Navigator>
   );
 }
 
@@ -166,7 +193,7 @@ function RootNavigator() {
         <Tab.Screen component={HomeStackNavigator} name="Home" options={{ title: 'Home' }} />
         <Tab.Screen component={ScheduleStackNavigator} name="Rooster" options={{ title: 'Rooster' }} />
         <Tab.Screen component={GradesScreen} name="Cijfers" options={{ title: 'Cijfers' }} />
-        <Tab.Screen component={ProfileScreen} name="Profiel" options={{ title: 'Profiel' }} />
+        <Tab.Screen component={ProfileStackNavigator} name="Profiel" options={{ title: 'Profiel' }} />
       </Tab.Navigator>
     </NavigationContainer>
   );

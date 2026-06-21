@@ -17,10 +17,15 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "nl.walburgcollege.app"
+      "bundleIdentifier": "nl.walburgcollege.app",
+      "buildNumber": "1",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "package": "nl.walburgcollege.app",
+      "versionCode": 1,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -46,35 +51,46 @@
               "name": "WalburgNextLessonWidget",
               "displayName": "Volgende les",
               "description": "Toon je eerstvolgende les op het beginscherm.",
-              "supportedFamilies": ["systemSmall"]
+              "supportedFamilies": [
+                "systemSmall"
+              ]
             },
             {
               "name": "WalburgTodayAgendaWidget",
               "displayName": "Schoolagenda vandaag",
               "description": "Laat het eerstvolgende item uit de schoolagenda van vandaag zien.",
-              "supportedFamilies": ["systemSmall"]
+              "supportedFamilies": [
+                "systemSmall"
+              ]
             },
             {
               "name": "WalburgLatestGradeWidget",
               "displayName": "Laatste cijfer",
               "description": "Laat je meest recente cijfer direct op het beginscherm zien.",
-              "supportedFamilies": ["systemSmall"]
+              "supportedFamilies": [
+                "systemSmall"
+              ]
             },
             {
               "name": "WalburgNextLessonAgendaWidget",
               "displayName": "Les + agenda",
               "description": "Combineert je eerstvolgende les met het belangrijkste agenda-item van vandaag.",
-              "supportedFamilies": ["systemMedium"]
+              "supportedFamilies": [
+                "systemMedium"
+              ]
             },
             {
               "name": "WalburgNextLessonGradeWidget",
               "displayName": "Les + cijfer",
               "description": "Combineert je eerstvolgende les met je meest recente cijfer.",
-              "supportedFamilies": ["systemMedium"]
+              "supportedFamilies": [
+                "systemMedium"
+              ]
             }
           ]
         }
-      ]
+      ],
+      "expo-asset"
     ]
   }
 }
