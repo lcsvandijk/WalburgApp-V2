@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "Walburg College",
-    "slug": "walburg-college-zwijndrecht",
+    "slug": "walburg",
     "scheme": [
       "walburgcollege",
       "m6loapp"
@@ -91,6 +91,29 @@
         }
       ],
       "expo-asset"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "build": {
+          "experimental": {
+            "ios": {
+              "appExtensions": [
+                {
+                  "targetName": "ExpoWidgetsTarget",
+                  "bundleIdentifier": "nl.walburgcollege.app.ExpoWidgetsTarget",
+                  "entitlements": {
+                    "com.apple.security.application-groups": [
+                      "group.nl.walburgcollege.app"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "projectId": "a6585cef-203f-49f8-9317-b168f8b9d5f1"
+      }
+    },
+    "owner": "info.leesloods"
   }
 }
